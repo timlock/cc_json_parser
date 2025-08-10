@@ -4,8 +4,8 @@ use std::num::{ParseFloatError, ParseIntError};
 
 #[derive(Debug)]
 pub struct Error {
-    error_kind: ErrorKind,
-    position: usize,
+    pub error_kind: ErrorKind,
+    pub position: usize,
 }
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -199,9 +199,10 @@ impl<'a> Parser<'a> {
     fn parse_key(&mut self) -> Result<String, ErrorKind> {
         let begin = self.read;
         loop {
-            let candidate = self.remaining().char_indices().find(|(i, c)| {
-                return *c == '"'
-            });
+            let candidate = self
+                .remaining()
+                .char_indices()
+                .find(|(i, c)| return *c == '"');
 
             match candidate {
                 Some((pos, character)) => self.read += pos + character.len_utf8(),
@@ -211,7 +212,7 @@ impl<'a> Parser<'a> {
                 }
             };
             if !self.last_consumed_char_is_escaped() {
-                let string = String::from(&self.content[begin..self.read -1]);
+                let string = String::from(&self.content[begin..self.read - 1]);
                 return Ok(string);
             }
         }
@@ -222,12 +223,16 @@ impl<'a> Parser<'a> {
 
         while let Some((index, character)) = self.remaining().char_indices().next() {
             if character.is_ascii_digit()
+                || character == '+'
+                || character == '-'
                 || character == '.'
                 || character == 'e'
                 || character == 'E'
             {
                 self.read += index + character.len_utf8();
-            }else {break}
+            } else {
+                break;
+            }
         }
         let number = String::from(&self.consumed()[begin..]);
 
