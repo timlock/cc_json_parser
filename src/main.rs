@@ -1,3 +1,4 @@
+use cc_json_parser::parse;
 use std::fs;
 
 fn main() {
@@ -12,14 +13,19 @@ fn main() {
 }
 
 fn run_tests(folder: &str) {
-    // fs::read_dir(folder)
-    //     .unwrap()
-    //     .map(|entry| entry.unwrap().file_name())
-    //     .for_each(|path| {
-    //         let fullpath = folder.to_owned() + path.to_str().unwrap();
-    //         let json = fs::read_to_string(&fullpath).unwrap();
-    //         println!("{fullpath}");
-    //         let is_valid = validate(&json);
-    //         println!("  is {is_valid}");
-    //     });
+    fs::read_dir(folder)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .for_each(|path| {
+            let fullpath = folder.to_owned() + path.to_str().unwrap();
+            if !fullpath.ends_with(".json"){
+                return;
+            };
+            let json = fs::read_to_string(&fullpath).unwrap();
+            println!("{fullpath}");
+            match parse(&json){
+                Ok(json_value) => println!("Value: {json_value:?}"),
+                Err(err) => println!("Error: {err}"),
+            }
+        });
 }

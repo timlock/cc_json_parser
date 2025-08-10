@@ -1,159 +1,277 @@
 use std::collections::HashMap;
-use std::fmt::{Debug, Display, Formatter};
-
-pub struct Error {
-    error_type: ErrorType,
-    position: usize,
-}
+use std::fmt::{Debug, Display, Formatter, Write, write};
+use std::num::{ParseFloatError, ParseIntError};
 
 #[derive(Debug)]
-pub enum ErrorType {
+pub struct Error {
+    error_kind: ErrorKind,
+    position: usize,
+}
+impl Display for Error {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} at position {}", self.error_kind, self.position)
+    }
+}
+
+impl std::error::Error for Error {}
+
+#[derive(Debug)]
+pub enum ErrorKind {
     UnexpectedToken(char),
     Incomplete,
+    ParseFloatError(ParseFloatError),
+    ParseIntError(ParseIntError),
 }
 
-impl Display for ErrorType {
+impl From<ParseFloatError> for ErrorKind {
+    fn from(value: ParseFloatError) -> Self {
+        ErrorKind::ParseFloatError(value)
+    }
+}
+
+impl From<ParseIntError> for ErrorKind {
+    fn from(value: ParseIntError) -> Self {
+        ErrorKind::ParseIntError(value)
+    }
+}
+
+impl Display for ErrorKind {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            ErrorType::UnexpectedToken(token) => write!(f, "unexpected token {token}"),
-            ErrorType::Incomplete => write!(f, "incomplete state"),
+            ErrorKind::UnexpectedToken(token) => write!(f, "unexpected token {token}"),
+            ErrorKind::Incomplete => write!(f, "incomplete state"),
+            ErrorKind::ParseFloatError(err) => write!(f, "{}", err),
+            ErrorKind::ParseIntError(err) => write!(f, "{}", err),
         }
     }
 }
 
-impl std::error::Error for ErrorType {}
-
-enum ParserType {
-    String(String),
-    Number(u32),
-    Object(HashMap<String, ParserType>),
-    Array(Vec<ParserType>),
-    True,
-    False,
-    Null,
+pub fn parse(content: &str) -> Result<JsonValue, Error> {
+    let mut parser = Parser::new(content);
+    parser.next()
 }
 
-fn next_token(mut input: Input) -> Option<MyResult<Token>> {
-    for character in input.remaining().chars() {
-        if character.is_whitespace() {
-            continue;
-        }
-
-        input.consume(character.len_utf8());
-
-        return Some(add_input(Token::try_from(character), input));
-    }
-    None
+pub struct Parser<'a> {
+    content: &'a str,
+    read: usize,
 }
 
-#[derive(Copy, Clone)]
-struct Input<'a> {
-    slice: &'a str,
-    consumed: usize,
-}
-
-impl<'a> Input<'a> {
-    fn remaining(&self) -> &'a str {
-        &self.slice[self.consumed..]
+impl<'a> Parser<'a> {
+    pub fn new(content: &str) -> Parser {
+        Parser { content, read: 0 }
     }
 
-    fn consume(&mut self, n: usize) {
-        self.consumed += n;
+    pub fn next(&mut self) -> Result<JsonValue, Error> {
+        self.parse_value().map_err(|error_kind| Error {
+            error_kind,
+            position: self.read,
+        })
     }
 
-    fn last_consumed_char(&self) -> Option<char> {
-        if self.consumed == 0 {
-            None
-        } else {
-            self.slice.chars().skip(self.consumed - 1).next()
-        }
-    }
-}
-fn parse_value(mut input: Input) -> MyResult<JsonValue> {
-    while let Some(result) = next_token(input) {
-        let (token, i) = result?;
-        input = i;
-
-        let value = match token {
-            Token::ObjectBegin => {
-                todo!()
-            }
-            Token::ArrayBegin => {
-                todo!()
-            }
-            Token::String => {
-                todo!()
-            }
-            Token::Number => {
-                todo!()
-            }
-            Token::True => parse_true(input),
-            Token::False => parse_false(input),
-            Token::Null => parse_null(input),
-            _ => Err((
-                ErrorType::UnexpectedToken(input.last_consumed_char().unwrap()),
-                input,
+    fn parse_value(&mut self) -> Result<JsonValue, ErrorKind> {
+        match self.next_token().ok_or(ErrorKind::Incomplete)?? {
+            Token::ObjectBegin => self.parse_object(),
+            Token::ArrayBegin => self.parse_array(),
+            Token::String => self.parse_string(),
+            Token::Number => self.parse_number(),
+            Token::True => self.parse_true(),
+            Token::False => self.parse_false(),
+            Token::Null => self.parse_null(),
+            _ => Err(ErrorKind::UnexpectedToken(
+                self.consumed().chars().last().unwrap(),
             )),
-        };
-    }
-
-    Err((ErrorType::Incomplete, input))
-}
-
-type MyResult<'a, T> = Result<(T, Input<'a>), (ErrorType, Input<'a>)>;
-
-fn add_input<'a, T>(result: Result<T, ErrorType>, input: Input<'a>) -> MyResult<'a, T> {
-    match result {
-        Ok(t) => Ok((t, input)),
-        Err(err) => Err((err, input)),
-    }
-}
-
-fn parse_string(mut input: Input) -> MyResult<JsonValue> {
-    let mut is_escaped = false;
-    let begin = input.consumed;
-    loop {
-        let pos = input
-            .remaining()
-            .find(['"', '\\'])
-            .ok_or((ErrorType::Incomplete, input))?;
-        input.consume(pos);
-        match input.last_consumed_char().expect("should have consumed a char") {
-            '"' if !is_escaped   => return Ok((JsonValue::String(String::from(&input.slice[begin..pos])), input)),
-            '"' => {}
-            '\\' => is_escaped = !is_escaped,
-            _ => panic!("last consumed char should be \" or \\")
-        };
-    }
-}
-
-fn parse_true(mut input: Input) -> MyResult<JsonValue> {
-    expect_slice(input, "rue").map(|((), i)| (JsonValue::Bool(true), i))
-}
-
-fn parse_false(mut input: Input) -> MyResult<JsonValue> {
-    expect_slice(input, "alse").map(|((), i)| (JsonValue::Bool(false), i))
-}
-
-fn parse_null(mut input: Input) -> MyResult<JsonValue> {
-    expect_slice(input, "ull").map(|((), i)| (JsonValue::Null, i))
-}
-fn expect_slice<'a>(mut input: Input<'a>, want: &str) -> MyResult<'a, ()> {
-    let prefix_chars: Vec<char> = want.chars().collect();
-    for (i, c) in input.remaining()[..want.len()].char_indices() {
-        input.consume(c.len_utf8());
-        if c != prefix_chars[i] {
-            return Err((ErrorType::UnexpectedToken(prefix_chars[i]), input));
         }
     }
 
-    Ok(((), input))
+    fn next_token(&mut self) -> Option<Result<Token, ErrorKind>> {
+        for (index, character) in self.remaining().char_indices() {
+            if character.is_whitespace() {
+                continue;
+            }
+
+            self.read += index + character.len_utf8();
+
+            return Some(Token::try_from(character));
+        }
+        None
+    }
+
+    fn peek_next_token(&self) -> Option<Result<Token, ErrorKind>> {
+        for character in self.remaining().chars() {
+            if character.is_whitespace() {
+                continue;
+            }
+
+            return Some(Token::try_from(character));
+        }
+        None
+    }
+
+    fn remaining(&self) -> &str {
+        &self.content[self.read..]
+    }
+
+    fn consumed(&self) -> &str {
+        &self.content[..self.read]
+    }
+
+    fn parse_true(&mut self) -> Result<JsonValue, ErrorKind> {
+        self.expect_char('r')?;
+        self.expect_char('u')?;
+        self.expect_char('e')?;
+        Ok(JsonValue::Bool(true))
+    }
+
+    fn parse_false(&mut self) -> Result<JsonValue, ErrorKind> {
+        self.expect_char('a')?;
+        self.expect_char('l')?;
+        self.expect_char('s')?;
+        self.expect_char('e')?;
+        Ok(JsonValue::Bool(false))
+    }
+
+    fn parse_null(&mut self) -> Result<JsonValue, ErrorKind> {
+        self.expect_char('u')?;
+        self.expect_char('l')?;
+        self.expect_char('l')?;
+        Ok(JsonValue::Null)
+    }
+
+    fn parse_object(&mut self) -> Result<JsonValue, ErrorKind> {
+        let mut object = HashMap::new();
+
+        if let Some(Ok(Token::ObjectEnd)) = self.peek_next_token() {
+            self.expect_token(Token::ObjectEnd)?;
+            return Ok(JsonValue::Object(object));
+        }
+
+        self.expect_token(Token::String)?;
+        let key = self.parse_key()?;
+
+        self.expect_token(Token::Colon)?;
+        let value = self.parse_value()?;
+
+        object.insert(key, value);
+
+        while Token::Comma == self.peek_next_token().ok_or(ErrorKind::Incomplete)?? {
+            self.expect_token(Token::Comma)?;
+
+            self.expect_token(Token::String)?;
+            let key = self.parse_key()?;
+
+            self.expect_token(Token::Colon)?;
+
+            let value = self.parse_value()?;
+            object.insert(key, value);
+        }
+
+        self.expect_token(Token::ObjectEnd)?;
+
+        Ok(JsonValue::Object(object))
+    }
+
+    fn parse_array(&mut self) -> Result<JsonValue, ErrorKind> {
+        let mut array = Vec::new();
+
+        if let Some(Ok(Token::ArrayEnd)) = self.peek_next_token() {
+            self.expect_token(Token::ArrayEnd)?;
+            return Ok(JsonValue::Array(array));
+        }
+
+        let item = self.parse_value()?;
+        array.push(item);
+        while Token::Comma == self.peek_next_token().ok_or(ErrorKind::Incomplete)?? {
+            self.expect_token(Token::Comma)?;
+
+            let item = self.parse_value()?;
+            array.push(item);
+        }
+
+        self.expect_token(Token::ArrayEnd)?;
+
+        Ok(JsonValue::Array(array))
+    }
+
+    fn parse_string(&mut self) -> Result<JsonValue, ErrorKind> {
+        self.parse_key().map(|string| JsonValue::String(string))
+    }
+
+    fn parse_key(&mut self) -> Result<String, ErrorKind> {
+        let begin = self.read;
+        loop {
+            let candidate = self.remaining().char_indices().find(|(i, c)| {
+                return *c == '"'
+            });
+
+            match candidate {
+                Some((pos, character)) => self.read += pos + character.len_utf8(),
+                None => {
+                    self.read = self.content.len();
+                    return Err(ErrorKind::Incomplete);
+                }
+            };
+            if !self.last_consumed_char_is_escaped() {
+                let string = String::from(&self.content[begin..self.read -1]);
+                return Ok(string);
+            }
+        }
+    }
+
+    fn parse_number(&mut self) -> Result<JsonValue, ErrorKind> {
+        let begin = self.read - 1;
+
+        while let Some((index, character)) = self.remaining().char_indices().next() {
+            if character.is_ascii_digit()
+                || character == '.'
+                || character == 'e'
+                || character == 'E'
+            {
+                self.read += index + character.len_utf8();
+            }else {break}
+        }
+        let number = String::from(&self.consumed()[begin..]);
+
+        Ok(JsonValue::Number(number.parse()?))
+    }
+
+    fn expect_char(&mut self, want: char) -> Result<(), ErrorKind> {
+        let (result, read) = match self.remaining().char_indices().next() {
+            Some((i, c)) if c == want => (Ok(()), i + c.len_utf8()),
+            Some((i, c)) => (Err(ErrorKind::UnexpectedToken(c)), i + c.len_utf8()),
+            None => (Err(ErrorKind::Incomplete), 0),
+        };
+        self.read += read;
+        result
+    }
+
+    fn expect_token(&mut self, want: Token) -> Result<(), ErrorKind> {
+        match self.next_token() {
+            Some(Ok(token)) if token == want => Ok(()),
+            Some(Ok(_)) => Err(ErrorKind::UnexpectedToken(
+                self.consumed()
+                    .chars()
+                    .last()
+                    .expect("there should be at least one consumed char after reading a token"),
+            )),
+            Some(Err(err)) => Err(err),
+            None => Err(ErrorKind::Incomplete),
+        }
+    }
+
+    fn last_consumed_char_is_escaped(&self) -> bool {
+        let mut is_escaped = false;
+        while let Some('\\') = self.consumed().chars().rev().next() {
+            is_escaped = !is_escaped;
+        }
+
+        is_escaped
+    }
 }
 
 #[derive(Debug)]
 pub enum JsonValue {
     String(String),
-    Number(u32),
+    Number(f64),
     Object(HashMap<String, JsonValue>),
     Array(Vec<JsonValue>),
     Bool(bool),
@@ -176,7 +294,7 @@ enum Token {
 }
 
 impl TryFrom<char> for Token {
-    type Error = ErrorType;
+    type Error = ErrorKind;
 
     fn try_from(value: char) -> Result<Self, Self::Error> {
         let token = match value {
@@ -192,7 +310,7 @@ impl TryFrom<char> for Token {
             'n' => Token::Null,
             ':' => Token::Colon,
             ',' => Token::Comma,
-            _ => return Err(ErrorType::UnexpectedToken(value)),
+            _ => return Err(ErrorKind::UnexpectedToken(value)),
         };
 
         Ok(token)
