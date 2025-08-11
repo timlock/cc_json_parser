@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
-use std::fmt::{Debug, Display, Formatter, Write};
-use std::io::Seek;
-use std::num::{ParseFloatError, ParseIntError};
+use std::fmt::{Debug, Display, Formatter};
+use std::num::{ParseFloatError};
 
 #[derive(Debug, PartialEq)]
 pub struct Error {
@@ -21,7 +20,6 @@ pub enum ErrorKind {
     UnexpectedToken(char),
     Incomplete,
     ParseFloatError(ParseFloatError),
-    ParseIntError(ParseIntError),
 }
 
 impl From<ParseFloatError> for ErrorKind {
@@ -30,11 +28,6 @@ impl From<ParseFloatError> for ErrorKind {
     }
 }
 
-impl From<ParseIntError> for ErrorKind {
-    fn from(value: ParseIntError) -> Self {
-        ErrorKind::ParseIntError(value)
-    }
-}
 
 impl Display for ErrorKind {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -42,7 +35,6 @@ impl Display for ErrorKind {
             ErrorKind::UnexpectedToken(token) => write!(f, "unexpected token {token}"),
             ErrorKind::Incomplete => write!(f, "incomplete state"),
             ErrorKind::ParseFloatError(err) => write!(f, "{}", err),
-            ErrorKind::ParseIntError(err) => write!(f, "{}", err),
         }
     }
 }
