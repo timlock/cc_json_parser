@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Display, Formatter};
-use std::num::{ParseFloatError};
+use std::num::ParseFloatError;
 
 #[derive(Debug, PartialEq)]
 pub struct Error {
@@ -27,7 +27,6 @@ impl From<ParseFloatError> for ErrorKind {
         ErrorKind::ParseFloatError(value)
     }
 }
-
 
 impl Display for ErrorKind {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -121,6 +120,11 @@ pub fn parse(content: &str) -> Result<JsonValue, Error> {
     parser.next()
 }
 
+pub fn parse_object(content: &str, want: &mut BTreeMap<String, JsonValue>) -> Result<(), Error> {
+    let mut parser = Parser::new(content);
+    parser.parse_object(want)
+}
+
 pub struct Parser<'a> {
     content: &'a str,
     read: usize,
@@ -132,21 +136,41 @@ impl<'a> Parser<'a> {
     }
 
     pub fn next(&mut self) -> Result<JsonValue, Error> {
-        self.parse_value().map_err(|error_kind| Error {
+        self.expect_value().map_err(|error_kind| Error {
             error_kind,
             position: self.read,
         })
     }
 
-    fn parse_value(&mut self) -> Result<JsonValue, ErrorKind> {
+    pub fn parse_object(&mut self, want: &mut BTreeMap<String, JsonValue>) -> Result<(), Error> {
+        self.expect_token(Token::ObjectBegin)
+            .map_err(|error_kind| Error {
+                error_kind,
+                position: self.read,
+            })?;
+        let mut got = self.expect_object().map_err(|error_kind| Error {
+            error_kind,
+            position: self.read,
+        })?;
+
+        for (key, value) in want.iter_mut() {
+            if let Some(got_value) = got.remove(key) {
+                *value = got_value
+            }
+        }
+
+        Ok(())
+    }
+
+    fn expect_value(&mut self) -> Result<JsonValue, ErrorKind> {
         match self.next_token().ok_or(ErrorKind::Incomplete)?? {
-            Token::ObjectBegin => self.parse_object().map(JsonValue::from),
-            Token::ArrayBegin => self.parse_array().map(JsonValue::from),
-            Token::String => self.parse_string().map(JsonValue::from),
-            Token::Number => self.parse_number().map(JsonValue::from),
-            Token::True => self.parse_true().map(JsonValue::from),
-            Token::False => self.parse_false().map(JsonValue::from),
-            Token::Null => self.parse_null(),
+            Token::ObjectBegin => self.expect_object().map(JsonValue::from),
+            Token::ArrayBegin => self.expect_array().map(JsonValue::from),
+            Token::String => self.expect_string().map(JsonValue::from),
+            Token::Number => self.expect_number().map(JsonValue::from),
+            Token::True => self.expect_true().map(JsonValue::from),
+            Token::False => self.expect_false().map(JsonValue::from),
+            Token::Null => self.expect_null(),
             _ => Err(ErrorKind::UnexpectedToken(
                 self.consumed().chars().last().unwrap(),
             )),
@@ -185,14 +209,14 @@ impl<'a> Parser<'a> {
         &self.content[..self.read]
     }
 
-    fn parse_true(&mut self) -> Result<bool, ErrorKind> {
+    fn expect_true(&mut self) -> Result<bool, ErrorKind> {
         self.expect_char('r')?;
         self.expect_char('u')?;
         self.expect_char('e')?;
         Ok(true)
     }
 
-    fn parse_false(&mut self) -> Result<bool, ErrorKind> {
+    fn expect_false(&mut self) -> Result<bool, ErrorKind> {
         self.expect_char('a')?;
         self.expect_char('l')?;
         self.expect_char('s')?;
@@ -200,14 +224,14 @@ impl<'a> Parser<'a> {
         Ok(false)
     }
 
-    fn parse_null(&mut self) -> Result<JsonValue, ErrorKind> {
+    fn expect_null(&mut self) -> Result<JsonValue, ErrorKind> {
         self.expect_char('u')?;
         self.expect_char('l')?;
         self.expect_char('l')?;
         Ok(JsonValue::Null)
     }
 
-    fn parse_object(&mut self) -> Result<BTreeMap<String, JsonValue>, ErrorKind> {
+    fn expect_object(&mut self) -> Result<BTreeMap<String, JsonValue>, ErrorKind> {
         let mut object = BTreeMap::new();
 
         if let Some(Ok(Token::ObjectEnd)) = self.peek_next_token() {
@@ -215,24 +239,18 @@ impl<'a> Parser<'a> {
             return Ok(object);
         }
 
-        self.expect_token(Token::String)?;
-        let key = self.parse_string()?;
-
-        self.expect_token(Token::Colon)?;
-        let value = self.parse_value()?;
-
-        object.insert(key, value);
-
-        while Token::Comma == self.peek_next_token().ok_or(ErrorKind::Incomplete)?? {
-            self.expect_token(Token::Comma)?;
-
+        loop {
             self.expect_token(Token::String)?;
-            let key = self.parse_string()?;
+            let key = self.expect_string()?;
 
             self.expect_token(Token::Colon)?;
-
-            let value = self.parse_value()?;
+            let value = self.expect_value()?;
             object.insert(key, value);
+
+            if Token::Comma != self.peek_next_token().ok_or(ErrorKind::Incomplete)?? {
+                break;
+            }
+            self.expect_token(Token::Comma)?;
         }
 
         self.expect_token(Token::ObjectEnd)?;
@@ -240,7 +258,7 @@ impl<'a> Parser<'a> {
         Ok(object)
     }
 
-    fn parse_array(&mut self) -> Result<Vec<JsonValue>, ErrorKind> {
+    fn expect_array(&mut self) -> Result<Vec<JsonValue>, ErrorKind> {
         let mut array = Vec::new();
 
         if let Some(Ok(Token::ArrayEnd)) = self.peek_next_token() {
@@ -248,13 +266,14 @@ impl<'a> Parser<'a> {
             return Ok(array);
         }
 
-        let item = self.parse_value()?;
-        array.push(item);
-        while Token::Comma == self.peek_next_token().ok_or(ErrorKind::Incomplete)?? {
-            self.expect_token(Token::Comma)?;
-
-            let item = self.parse_value()?;
+        loop {
+            let item = self.expect_value()?;
             array.push(item);
+
+            if Token::Comma != self.peek_next_token().ok_or(ErrorKind::Incomplete)?? {
+                break;
+            }
+            self.expect_token(Token::Comma)?;
         }
 
         self.expect_token(Token::ArrayEnd)?;
@@ -262,7 +281,7 @@ impl<'a> Parser<'a> {
         Ok(array)
     }
 
-    fn parse_string(&mut self) -> Result<String, ErrorKind> {
+    fn expect_string(&mut self) -> Result<String, ErrorKind> {
         let begin = self.read;
         loop {
             let candidate = self
@@ -284,7 +303,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_number(&mut self) -> Result<f64, ErrorKind> {
+    fn expect_number(&mut self) -> Result<f64, ErrorKind> {
         let begin = self.read - 1;
 
         let mut iter = self.remaining().chars();
@@ -571,6 +590,34 @@ mod tests {
                 ])])]),
             ])])]),
         ])])]);
+        assert_eq!(want, got);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_value() -> Result<(), Box<dyn std::error::Error>> {
+        let input = r#"
+        {
+          "key": "value",
+          "key2": "value"
+        }
+       "#;
+        let mut got = BTreeMap::from([
+            (String::from("key"), JsonValue::Null),
+            (String::from("key2"), JsonValue::Null),
+        ]);
+        parse_object(input, &mut got)?;
+
+        let want = BTreeMap::from([
+            (
+                String::from("key"),
+                JsonValue::String(String::from("value")),
+            ),
+            (
+                String::from("key2"),
+                JsonValue::String(String::from("value")),
+            ),
+        ]);
         assert_eq!(want, got);
         Ok(())
     }
