@@ -1,25 +1,38 @@
 use std::collections::BTreeMap;
+use std::error;
 use std::fmt::{Debug, Display, Formatter};
 use std::num::ParseFloatError;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub struct Error {
     pub error_kind: ErrorKind,
     pub position: usize,
 }
+
+impl Error {
+    pub fn new(error_kind: ErrorKind, position: usize) -> Error {
+        Error {
+            error_kind,
+            position,
+        }
+    }
+}
+
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} at position {}", self.error_kind, self.position)
     }
 }
 
-impl std::error::Error for Error {}
+impl error::Error for Error {}
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub enum ErrorKind {
     UnexpectedToken(char),
     Incomplete,
     ParseFloatError(ParseFloatError),
+    UnknownField(String),
+    UnexpectedType(&'static str, &'static str),
 }
 
 impl From<ParseFloatError> for ErrorKind {
@@ -34,6 +47,8 @@ impl Display for ErrorKind {
             ErrorKind::UnexpectedToken(token) => write!(f, "unexpected token {token}"),
             ErrorKind::Incomplete => write!(f, "incomplete state"),
             ErrorKind::ParseFloatError(err) => write!(f, "{}", err),
+            ErrorKind::UnknownField(field) => write!(f, "unknown field: '{field}'",),
+            ErrorKind::UnexpectedType(got, want) => write!(f, "got {got} but wanted {want}"),
         }
     }
 }
@@ -45,6 +60,19 @@ pub enum JsonValue {
     Array(Vec<JsonValue>),
     Bool(bool),
     Null,
+}
+
+impl JsonValue {
+    pub fn value_type(&self) -> &'static str {
+        match self {
+            JsonValue::String(_) => "string",
+            JsonValue::Number(_) => "number",
+            JsonValue::Object(_) => "object",
+            JsonValue::Array(_) => "array",
+            JsonValue::Bool(_) => "bool",
+            JsonValue::Null => "null",
+        }
+    }
 }
 
 impl From<String> for JsonValue {
@@ -125,33 +153,100 @@ pub fn parse_object(content: &str, want: &mut BTreeMap<String, JsonValue>) -> Re
     parser.parse_object(want)
 }
 
+pub fn parse_into<T>(content: &str, destination: &mut T) -> Result<(), Error>
+where
+    T: FromJson,
+{
+    let mut parser = Parser::new(content);
+    parser.parse_into(destination)
+}
+
+pub trait FromJson: Sized {
+    fn from_json(value: JsonValue) -> Result<Self, ErrorKind>;
+}
+
+impl FromJson for bool {
+    fn from_json(value: JsonValue) -> Result<Self, ErrorKind> {
+        match value {
+            JsonValue::Bool(value) => Ok(value),
+            _ => Err(ErrorKind::UnexpectedType(value.value_type(), "bool")),
+        }
+    }
+}
+
+impl FromJson for String {
+    fn from_json(value: JsonValue) -> Result<Self, ErrorKind> {
+        match value {
+            JsonValue::String(value) => Ok(value),
+            _ => Err(ErrorKind::UnexpectedType(value.value_type(), "string")),
+        }
+    }
+}
+
+impl FromJson for f64 {
+    fn from_json(value: JsonValue) -> Result<Self, ErrorKind> {
+        match value {
+            JsonValue::Number(value) => Ok(value),
+            _ => Err(ErrorKind::UnexpectedType(value.value_type(), "number")),
+        }
+    }
+}
+
+impl<T> FromJson for Option<T>
+where
+    T: FromJson + Default,
+{
+    fn from_json(value: JsonValue) -> Result<Self, ErrorKind> {
+        match value {
+            JsonValue::Null => Ok(None),
+            _ => {
+                let parsed = T::from_json(value)?;
+                Ok(Some(parsed))
+            }
+        }
+    }
+}
+
+impl<T> FromJson for Vec<T>
+where
+    T: FromJson,
+{
+    fn from_json(value: JsonValue) -> Result<Self, ErrorKind> {
+        match value {
+            JsonValue::Array(values) => {
+                let mut parsed = Vec::with_capacity(values.len());
+                for value in values {
+                    parsed.push(T::from_json(value)?);
+                }
+                Ok(parsed)
+            }
+            _ => Err(ErrorKind::UnexpectedType(value.value_type(), "array")),
+        }
+    }
+}
+
 pub struct Parser<'a> {
     content: &'a str,
     read: usize,
 }
 
 impl<'a> Parser<'a> {
-    pub fn new(content: &str) -> Parser {
+    pub fn new(content: &str) -> Parser<'_> {
         Parser { content, read: 0 }
     }
 
     pub fn next(&mut self) -> Result<JsonValue, Error> {
-        self.expect_value().map_err(|error_kind| Error {
-            error_kind,
-            position: self.read,
-        })
+        self.expect_value()
+            .map_err(|error_kind| Error::new(error_kind, self.read))
     }
 
     pub fn parse_object(&mut self, want: &mut BTreeMap<String, JsonValue>) -> Result<(), Error> {
         self.expect_token(Token::ObjectBegin)
-            .map_err(|error_kind| Error {
-                error_kind,
-                position: self.read,
-            })?;
-        let mut got = self.expect_object().map_err(|error_kind| Error {
-            error_kind,
-            position: self.read,
-        })?;
+            .map_err(|error_kind| Error::new(error_kind, self.read))?;
+
+        let mut got = self
+            .expect_object()
+            .map_err(|error_kind| Error::new(error_kind, self.read))?;
 
         for (key, value) in want.iter_mut() {
             if let Some(got_value) = got.remove(key) {
@@ -159,6 +254,19 @@ impl<'a> Parser<'a> {
             }
         }
 
+        Ok(())
+    }
+
+    pub fn parse_into<T>(&mut self, destination: &mut T) -> Result<(), Error>
+    where
+        T: FromJson,
+    {
+        let value = self
+            .expect_value()
+            .map_err(|error_kind| Error::new(error_kind, self.read))?;
+
+        *destination =
+            T::from_json(value).map_err(|error_kind| Error::new(error_kind, self.read))?;
         Ok(())
     }
 
@@ -618,6 +726,17 @@ mod tests {
                 JsonValue::String(String::from("value")),
             ),
         ]);
+        assert_eq!(want, got);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_into_array() -> Result<(), Box<dyn error::Error>> {
+        let input = "[1,2, null]";
+        let mut got: Vec<Option<f64>> = Vec::new();
+        parse_into(input, &mut got)?;
+
+        let want = vec![Some(1.), Some(2.), None];
         assert_eq!(want, got);
         Ok(())
     }
