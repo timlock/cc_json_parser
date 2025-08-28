@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::num::ParseFloatError;
@@ -20,6 +21,11 @@ pub enum ErrorKind {
     UnexpectedToken(char),
     Incomplete,
     ParseFloatError(ParseFloatError),
+    InvalidType {
+        key: String,
+        want: &'static str,
+        got: &'static str,
+    },
 }
 
 impl From<ParseFloatError> for ErrorKind {
@@ -34,9 +40,45 @@ impl Display for ErrorKind {
             ErrorKind::UnexpectedToken(token) => write!(f, "unexpected token {token}"),
             ErrorKind::Incomplete => write!(f, "incomplete state"),
             ErrorKind::ParseFloatError(err) => write!(f, "{}", err),
+            ErrorKind::InvalidType { key, want, got } => {
+                write!(f, "field '{}' is not of type {} but {}", key, want, got)
+            }
         }
     }
 }
+
+pub trait PParser {
+    fn parse_string(&mut self) -> Option<Result<String, &'static str>>;
+    fn parse_f64(&mut self) -> Option<Result<f64, &'static str>>;
+
+    fn parse_bool(&mut self) -> Option<Result<bool, &'static str>>;
+}
+
+pub trait Parsable {
+    fn parse(&mut self, parser: &mut dyn PParser) -> Result<(), &'static str>;
+}
+
+pub trait FromJson {
+    fn fields(&self) -> Vec<(&str)>;
+    fn set(&mut self, key: &str, value: JsonValue) -> Result<(), ErrorKind>;
+}
+
+pub enum UnmarshalError {
+    InvalidType(&'static str),
+    InvalidFieldType(&'static str),
+    InvalidValueType(&'static str),
+}
+
+pub trait Unmarshal: Any {
+    fn set(&mut self, value: &dyn Unmarshal) -> Result<(), UnmarshalError>;
+    fn push(&mut self, value: &dyn Unmarshal) -> Result<(), UnmarshalError>;
+    fn set_field(
+        &mut self,
+        key: &dyn Unmarshal,
+        value: &dyn Unmarshal,
+    ) -> Result<(), UnmarshalError>;
+}
+
 #[derive(Debug, PartialEq)]
 pub enum JsonValue {
     String(String),
@@ -45,6 +87,30 @@ pub enum JsonValue {
     Array(Vec<JsonValue>),
     Bool(bool),
     Null,
+}
+
+impl JsonValue {
+    pub fn value_type(&self) -> &'static str {
+        match self {
+            JsonValue::String(_) => "string",
+            JsonValue::Number(_) => "number",
+            JsonValue::Object(_) => "object",
+            JsonValue::Array(_) => "array",
+            JsonValue::Bool(_) => "bool",
+            JsonValue::Null => "null",
+        }
+    }
+}
+
+impl TryFrom<JsonValue> for String {
+    type Error = (&'static str, &'static str);
+
+    fn try_from(value: JsonValue) -> Result<Self, Self::Error> {
+        match value {
+            JsonValue::String(string) => Ok(string),
+            _ => Err(("string", value.value_type())),
+        }
+    }
 }
 
 impl From<String> for JsonValue {
@@ -120,9 +186,335 @@ pub fn parse(content: &str) -> Result<JsonValue, Error> {
     parser.next()
 }
 
-pub fn parse_object(content: &str, want: &mut BTreeMap<String, JsonValue>) -> Result<(), Error> {
+pub fn parse_object(content: &str, want: &mut BTreeMap<&str, JsonValue>) -> Result<(), Error> {
+    todo!();
+    // let mut parser = Parser::new(content);
+    // parser.parse_object(want)
+}
+
+pub fn parse_any(content: &str, want: &mut dyn FromJson) -> Result<(), Error> {
+    let iter = want.fields();
+    let mut map = BTreeMap::new();
+    for name in iter {
+        map.insert(String::from(name), JsonValue::Null);
+    }
+
     let mut parser = Parser::new(content);
-    parser.parse_object(want)
+    parser.parse_object(&mut map)?;
+
+    for (field, value) in map {
+        want.set(&field, value).map_err(|error_kind| Error {
+            error_kind,
+            position: 0,
+        })?;
+    }
+
+    Ok(())
+}
+
+pub fn parse_parsable<T>(src: &str, dst: &mut T) -> Result<(), &'static str>
+where
+    T: Parsable,
+{
+    let mut parser = StreamingParser::new(src);
+    dst.parse(&mut parser)
+}
+
+impl<'a> PParser for StreamingParser<'a> {
+    fn parse_string(&mut self) -> Option<Result<String, &'static str>> {
+        todo!()
+    }
+
+    fn parse_f64(&mut self) -> Option<Result<f64, &'static str>> {
+        todo!()
+    }
+
+    fn parse_bool(&mut self) -> Option<Result<bool, &'static str>> {
+        todo!()
+    }
+}
+
+enum ValueType {
+    Object,
+    Array,
+}
+
+pub struct StreamingParser<'a> {
+    content: &'a str,
+    read: usize,
+    remaining: Vec<ValueType>,
+    last_token: Option<Token>,
+}
+
+impl<'a> StreamingParser<'a> {
+    pub fn new(content: &'a str) -> Self {
+        Self {
+            content,
+            read: 0,
+            remaining: Vec::new(),
+            last_token: None,
+        }
+    }
+
+    fn next_value(&mut self) -> Option<Result<JsonValue, ErrorKind>> {
+        if self.remaining.is_empty() {
+            let next_token = self.next_token()?;
+            let next_token = match next_token {
+                Ok(token) => token,
+                Err(err) => return Some(Err(err)),
+            };
+
+            self.last_token = Some(next_token);
+
+            let value_type = match next_token {
+                Token::ObjectBegin => ValueType::Object,
+                Token::ArrayBegin => ValueType::Array,
+                Token::String => return Some(self.expect_string().map(JsonValue::from)),
+                Token::Number => return Some(self.expect_number().map(JsonValue::from)),
+                Token::True => return Some(self.expect_true().map(JsonValue::from)),
+                Token::False => return Some(self.expect_false().map(JsonValue::from)),
+                Token::Null => return Some(self.expect_null()),
+                _ => {
+                    return Some(Err(ErrorKind::UnexpectedToken(
+                        self.consumed().chars().last().unwrap(),
+                    )));
+                }
+            };
+
+            self.remaining.push(value_type);
+        }
+
+        let current_type = self.remaining.last().unwrap();
+
+        match current_type {
+            ValueType::Object => {
+                match self.last_token.unwrap() {
+                    Token::ObjectBegin => {
+                        return match self.expect_string() {
+                            Ok(string) => {
+                                self.last_token = Some(Token::String);
+                                Some(Ok(JsonValue::from(string)))
+                            },
+                            Err(err) => Some(Err(err)),
+                        }
+                    }
+                    Token::ObjectEnd => {}
+                    Token::ArrayEnd => {}
+                    Token::String => {}
+                    Token::Number => {}
+                    Token::True => {}
+                    Token::False => {}
+                    Token::Null => {}
+                    Token::Colon => {}
+                    Token::Comma => {}
+                    _ =>
+                }
+            }
+            ValueType::Array => {}
+        }
+
+        None
+    }
+
+    fn expect_value(&mut self) -> Result<JsonValue, ErrorKind> {
+        match self.next_token().ok_or(ErrorKind::Incomplete)?? {
+            Token::ObjectBegin => self.expect_object().map(JsonValue::from),
+            Token::ArrayBegin => self.expect_array().map(JsonValue::from),
+            Token::String => self.expect_string().map(JsonValue::from),
+            Token::Number => self.expect_number().map(JsonValue::from),
+            Token::True => self.expect_true().map(JsonValue::from),
+            Token::False => self.expect_false().map(JsonValue::from),
+            Token::Null => self.expect_null(),
+            _ => Err(ErrorKind::UnexpectedToken(
+                self.consumed().chars().last().unwrap(),
+            )),
+        }
+    }
+
+    fn next_token(&mut self) -> Option<Result<Token, ErrorKind>> {
+        for (index, character) in self.remaining().char_indices() {
+            if character.is_whitespace() {
+                continue;
+            }
+
+            self.read += index + character.len_utf8();
+
+            return Some(Token::try_from(character));
+        }
+        None
+    }
+
+    fn peek_next_token(&self) -> Option<Result<Token, ErrorKind>> {
+        for character in self.remaining().chars() {
+            if character.is_whitespace() {
+                continue;
+            }
+
+            return Some(Token::try_from(character));
+        }
+        None
+    }
+
+    fn remaining(&self) -> &str {
+        &self.content[self.read..]
+    }
+
+    fn consumed(&self) -> &str {
+        &self.content[..self.read]
+    }
+
+    fn expect_true(&mut self) -> Result<bool, ErrorKind> {
+        self.expect_char('r')?;
+        self.expect_char('u')?;
+        self.expect_char('e')?;
+        Ok(true)
+    }
+
+    fn expect_false(&mut self) -> Result<bool, ErrorKind> {
+        self.expect_char('a')?;
+        self.expect_char('l')?;
+        self.expect_char('s')?;
+        self.expect_char('e')?;
+        Ok(false)
+    }
+
+    fn expect_null(&mut self) -> Result<JsonValue, ErrorKind> {
+        self.expect_char('u')?;
+        self.expect_char('l')?;
+        self.expect_char('l')?;
+        Ok(JsonValue::Null)
+    }
+
+    fn expect_object(&mut self) -> Result<BTreeMap<String, JsonValue>, ErrorKind> {
+        let mut object = BTreeMap::new();
+
+        if let Some(Ok(Token::ObjectEnd)) = self.peek_next_token() {
+            self.expect_token(Token::ObjectEnd)?;
+            return Ok(object);
+        }
+
+        loop {
+            self.expect_token(Token::String)?;
+            let key = self.expect_string()?;
+
+            self.expect_token(Token::Colon)?;
+            let value = self.expect_value()?;
+            object.insert(key, value);
+
+            if Token::Comma != self.peek_next_token().ok_or(ErrorKind::Incomplete)?? {
+                break;
+            }
+            self.expect_token(Token::Comma)?;
+        }
+
+        self.expect_token(Token::ObjectEnd)?;
+
+        Ok(object)
+    }
+
+    fn expect_array(&mut self) -> Result<Vec<JsonValue>, ErrorKind> {
+        let mut array = Vec::new();
+
+        if let Some(Ok(Token::ArrayEnd)) = self.peek_next_token() {
+            self.expect_token(Token::ArrayEnd)?;
+            return Ok(array);
+        }
+
+        loop {
+            let item = self.expect_value()?;
+            array.push(item);
+
+            if Token::Comma != self.peek_next_token().ok_or(ErrorKind::Incomplete)?? {
+                break;
+            }
+            self.expect_token(Token::Comma)?;
+        }
+
+        self.expect_token(Token::ArrayEnd)?;
+
+        Ok(array)
+    }
+
+    fn expect_string(&mut self) -> Result<String, ErrorKind> {
+        let begin = self.read;
+        loop {
+            let candidate = self
+                .remaining()
+                .char_indices()
+                .find(|(i, c)| return *c == '"');
+
+            match candidate {
+                Some((pos, character)) => self.read += pos + character.len_utf8(),
+                None => {
+                    self.read = self.content.len();
+                    return Err(ErrorKind::Incomplete);
+                }
+            };
+            if !self.last_consumed_char_is_escaped() {
+                let string = String::from(&self.content[begin..self.read - 1]);
+                return Ok(string);
+            }
+        }
+    }
+
+    fn expect_number(&mut self) -> Result<f64, ErrorKind> {
+        let begin = self.read - 1;
+
+        let mut iter = self.remaining().chars();
+        let mut read = 0;
+
+        while let Some(character) = iter.next() {
+            if character.is_ascii_digit()
+                || character == '+'
+                || character == '-'
+                || character == '.'
+                || character == 'e'
+                || character == 'E'
+            {
+                read += character.len_utf8();
+            } else {
+                break;
+            }
+        }
+        self.read += read;
+        let number = String::from(&self.consumed()[begin..]);
+
+        Ok(number.parse()?)
+    }
+
+    fn expect_char(&mut self, want: char) -> Result<(), ErrorKind> {
+        let (result, read) = match self.remaining().char_indices().next() {
+            Some((i, c)) if c == want => (Ok(()), i + c.len_utf8()),
+            Some((i, c)) => (Err(ErrorKind::UnexpectedToken(c)), i + c.len_utf8()),
+            None => (Err(ErrorKind::Incomplete), 0),
+        };
+        self.read += read;
+        result
+    }
+
+    fn expect_token(&mut self, want: Token) -> Result<(), ErrorKind> {
+        match self.next_token() {
+            Some(Ok(token)) if token == want => Ok(()),
+            Some(Ok(_)) => Err(ErrorKind::UnexpectedToken(
+                self.consumed()
+                    .chars()
+                    .last()
+                    .expect("there should be at least one consumed char after reading a token"),
+            )),
+            Some(Err(err)) => Err(err),
+            None => Err(ErrorKind::Incomplete),
+        }
+    }
+
+    fn last_consumed_char_is_escaped(&self) -> bool {
+        let mut is_escaped = false;
+        let mut iter = self.consumed().chars().rev().skip(1);
+        while let Some('\\') = iter.next() {
+            is_escaped = !is_escaped;
+        }
+
+        is_escaped
+    }
 }
 
 pub struct Parser<'a> {
@@ -595,29 +987,224 @@ mod tests {
     }
 
     #[test]
-    fn parse_value() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_parse_object() -> Result<(), Box<dyn std::error::Error>> {
         let input = r#"
         {
           "key": "value",
           "key2": "value"
         }
        "#;
-        let mut got = BTreeMap::from([
-            (String::from("key"), JsonValue::Null),
-            (String::from("key2"), JsonValue::Null),
-        ]);
+        let mut got = BTreeMap::from([("key", JsonValue::Null), ("key2", JsonValue::Null)]);
         parse_object(input, &mut got)?;
 
         let want = BTreeMap::from([
-            (
-                String::from("key"),
-                JsonValue::String(String::from("value")),
-            ),
-            (
-                String::from("key2"),
-                JsonValue::String(String::from("value")),
-            ),
+            ("key", JsonValue::String(String::from("value"))),
+            ("key2", JsonValue::String(String::from("value"))),
         ]);
+        assert_eq!(want, got);
+        Ok(())
+    }
+
+    #[derive(PartialEq, Debug)]
+    struct ParseValueTest {
+        key: String,
+        key2: String,
+        nested: Nested,
+    }
+
+    #[derive(PartialEq, Debug, Clone, Default)]
+    struct Nested {
+        number: i32,
+    }
+    impl Unmarshal for Nested {
+        fn set(&mut self, value: &dyn Unmarshal) -> Result<(), UnmarshalError> {
+            Err(UnmarshalError::InvalidType("Nested"))
+        }
+
+        fn push(&mut self, value: &dyn Unmarshal) -> Result<(), UnmarshalError> {
+            Err(UnmarshalError::InvalidType("Nested"))
+        }
+
+        fn set_field(
+            &mut self,
+            key: &dyn Unmarshal,
+            value: &dyn Unmarshal,
+        ) -> Result<(), UnmarshalError> {
+            let key = (key as &dyn Any)
+                .downcast_ref::<String>()
+                .ok_or(UnmarshalError::InvalidFieldType("string"))?;
+            match key.as_str() {
+                "number" => {
+                    self.number = (value as &dyn Any)
+                        .downcast_ref::<f64>()
+                        .ok_or(UnmarshalError::InvalidValueType("i32"))?
+                        .to_owned() as i32;
+                    Ok(())
+                }
+                _ => Ok(()),
+            }
+        }
+    }
+
+    impl Unmarshal for ParseValueTest {
+        fn set(&mut self, _: &dyn Unmarshal) -> Result<(), UnmarshalError> {
+            Err(UnmarshalError::InvalidType("ParseValueTest"))
+        }
+
+        fn push(&mut self, _: &dyn Unmarshal) -> Result<(), UnmarshalError> {
+            Err(UnmarshalError::InvalidType("ParseValueTest"))
+        }
+
+        fn set_field(
+            &mut self,
+            key: &dyn Unmarshal,
+            value: &dyn Unmarshal,
+        ) -> Result<(), UnmarshalError> {
+            let key = (key as &dyn Any)
+                .downcast_ref::<&str>()
+                .ok_or(UnmarshalError::InvalidFieldType("&str"))?;
+            match *key {
+                "key" => {
+                    self.key = (value as &dyn Any)
+                        .downcast_ref::<String>()
+                        .ok_or(UnmarshalError::InvalidValueType("String"))?
+                        .to_owned();
+                    Ok(())
+                }
+                "key2" => {
+                    self.key2 = (value as &dyn Any)
+                        .downcast_ref::<String>()
+                        .ok_or(UnmarshalError::InvalidValueType("String"))?
+                        .to_owned();
+                    Ok(())
+                }
+                "nested" => {
+                    self.nested = (value as &dyn Any)
+                        .downcast_ref::<Nested>()
+                        .ok_or(UnmarshalError::InvalidValueType("Nested"))?
+                        .to_owned();
+                    Ok(())
+                }
+                _ => Ok(()),
+            }
+        }
+    }
+
+    impl FromJson for ParseValueTest {
+        fn fields(&self) -> Vec<&str> {
+            vec!["key", "key2"]
+        }
+
+        fn set(&mut self, key: &str, value: JsonValue) -> Result<(), ErrorKind> {
+            match key {
+                "key" => {
+                    self.key = JsonValue::try_into(value).map_err(|(want, got)| {
+                        ErrorKind::InvalidType {
+                            key: String::from(key),
+                            want,
+                            got,
+                        }
+                    })?
+                }
+                "key2" => {
+                    self.key2 = JsonValue::try_into(value).map_err(|(want, got)| {
+                        ErrorKind::InvalidType {
+                            key: String::from(key),
+                            want,
+                            got,
+                        }
+                    })?
+                }
+                _ => return Err(ErrorKind::Incomplete),
+            };
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_parse_any() -> Result<(), Box<dyn std::error::Error>> {
+        let input = r#"
+        {
+          "key": "value",
+          "key2": "value"
+        }
+       "#;
+        let mut got = ParseValueTest {
+            key: String::new(),
+            key2: String::new(),
+            nested: Default::default(),
+        };
+        parse_any(input, &mut got)?;
+
+        let want = ParseValueTest {
+            key: String::from("value"),
+            key2: String::from("value"),
+            nested: Default::default(),
+        };
+        assert_eq!(want, got);
+        Ok(())
+    }
+
+    impl Parsable for Nested {
+        fn parse(&mut self, parser: &mut dyn PParser) -> Result<(), &'static str> {
+            let field_name = parser.parse_string().expect("expected field")?;
+            if field_name != "number" {
+                return Err("expected field 'number'");
+            }
+            self.number = parser.parse_f64().expect("expected value")? as i32;
+            Ok(())
+        }
+    }
+    impl Parsable for ParseValueTest {
+        fn parse(&mut self, parser: &mut dyn PParser) -> Result<(), &'static str> {
+            while let Some(field_name) = parser.parse_string() {
+                match field_name?.as_str() {
+                    "key" => self.key = parser.parse_string().expect("expected value")?,
+                    "key2" => self.key = parser.parse_string().expect("expected value")?,
+                    "nested" => self.nested.parse(parser)?,
+                    _ => return Err("unknown field"),
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl<T> Parsable for Vec<T>
+    where
+        T: Parsable + Default,
+    {
+        fn parse(&mut self, parser: &mut dyn PParser) -> Result<(), &'static str> {
+            loop {
+                let mut base = T::default();
+
+                match base.parse(parser) {
+                    Ok(_) => self.push(base),
+                    Err(err) => return Ok(()), //TODO distinguish between error and no more values
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_parsable() -> Result<(), Box<dyn std::error::Error>> {
+        let input = r#"
+        {
+          "key": "value",
+          "key2": "value"
+        }
+       "#;
+        let mut got = ParseValueTest {
+            key: String::new(),
+            key2: String::new(),
+            nested: Default::default(),
+        };
+        parse_any(input, &mut got)?;
+
+        let want = ParseValueTest {
+            key: String::from("value"),
+            key2: String::from("value"),
+            nested: Default::default(),
+        };
         assert_eq!(want, got);
         Ok(())
     }
