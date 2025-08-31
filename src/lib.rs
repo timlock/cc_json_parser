@@ -2,6 +2,7 @@ use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::num::ParseFloatError;
+use std::str::CharIndices;
 
 #[derive(Debug, PartialEq)]
 pub struct Error {
@@ -49,7 +50,7 @@ impl Display for ErrorKind {
     }
 }
 
-pub trait PParser {
+pub trait Parser {
     fn parse_string(&mut self) -> Option<Result<String, ErrorKind>>;
     fn parse_f64(&mut self) -> Option<Result<f64, ErrorKind>>;
 
@@ -57,12 +58,7 @@ pub trait PParser {
 }
 
 pub trait Parsable {
-    fn parse(&mut self, parser: &mut dyn PParser) -> Result<(), String>;
-}
-
-pub trait FromJson {
-    fn fields(&self) -> Vec<(&str)>;
-    fn set(&mut self, key: &str, value: JsonValue) -> Result<(), ErrorKind>;
+    fn parse(&mut self, parser: &mut dyn Parser) -> Result<(), String>;
 }
 
 pub enum UnmarshalError {
@@ -170,7 +166,7 @@ impl TryFrom<char> for Token {
             '\"' => Token::String,
             '-' => Token::Number,
             '0'..='9' => Token::Number,
-            't'| 'f' => Token::Bool,
+            't' | 'f' => Token::Bool,
             'n' => Token::Null,
             ':' => Token::Colon,
             ',' => Token::Comma,
@@ -182,34 +178,8 @@ impl TryFrom<char> for Token {
 }
 
 pub fn parse(content: &str) -> Result<JsonValue, Error> {
-    let mut parser = Parser::new(content);
+    let mut parser = JSONParser::new(content);
     parser.next()
-}
-
-pub fn parse_object(content: &str, want: &mut BTreeMap<&str, JsonValue>) -> Result<(), Error> {
-    todo!();
-    // let mut parser = Parser::new(content);
-    // parser.parse_object(want)
-}
-
-pub fn parse_any(content: &str, want: &mut dyn FromJson) -> Result<(), Error> {
-    let iter = want.fields();
-    let mut map = BTreeMap::new();
-    for name in iter {
-        map.insert(String::from(name), JsonValue::Null);
-    }
-
-    let mut parser = Parser::new(content);
-    parser.parse_object(&mut map)?;
-
-    for (field, value) in map {
-        want.set(&field, value).map_err(|error_kind| Error {
-            error_kind,
-            position: 0,
-        })?;
-    }
-
-    Ok(())
 }
 
 pub fn incremental_parse_parsable<T>(src: &str, dst: &mut T) -> Result<(), String>
@@ -220,7 +190,7 @@ where
     dst.parse(&mut parser)
 }
 
-impl<'a> PParser for IncrementalParser<'a> {
+impl<'a> Parser for IncrementalParser<'a> {
     fn parse_string(&mut self) -> Option<Result<String, ErrorKind>> {
         match self.next_value()? {
             Ok(JsonValue::String(string)) => Some(Ok(string)),
@@ -381,14 +351,14 @@ enum Validator {
 }
 
 pub struct IncrementalParser<'a> {
-    inner: Parser<'a>,
+    inner: JSONParser<'a>,
     validator_stack: Vec<Validator>,
 }
 
 impl<'a> IncrementalParser<'a> {
     pub fn new(content: &'a str) -> Self {
         Self {
-            inner: Parser::new(content),
+            inner: JSONParser::new(content),
             validator_stack: Vec::new(),
         }
     }
@@ -500,14 +470,14 @@ impl<'a> IncrementalParser<'a> {
     }
 }
 
-pub struct Parser<'a> {
+pub struct JSONParser<'a> {
     content: &'a str,
     read: usize,
 }
 
-impl<'a> Parser<'a> {
-    pub fn new(content: &str) -> Parser {
-        Parser { content, read: 0 }
+impl<'a> JSONParser<'a> {
+    pub fn new(content: &str) -> JSONParser {
+        JSONParser { content, read: 0 }
     }
 
     pub fn next(&mut self) -> Result<JsonValue, Error> {
@@ -583,12 +553,22 @@ impl<'a> Parser<'a> {
         &self.content[..self.read]
     }
 
-    fn expect_bool(&mut self) -> Result<bool, ErrorKind>{
-       match self.consumed().chars().last().expect("Should not to parse bool when no characters have been consumed"){
-           't' => self.expect_true(),
-           'f' => self.expect_false(),
-           _ => Err(ErrorKind::UnexpectedToken(self.consumed().chars().last().expect("The consumed chars should not disappear")))
-       }
+    fn expect_bool(&mut self) -> Result<bool, ErrorKind> {
+        match self
+            .consumed()
+            .chars()
+            .last()
+            .expect("Should not to parse bool when no characters have been consumed")
+        {
+            't' => self.expect_true(),
+            'f' => self.expect_false(),
+            _ => Err(ErrorKind::UnexpectedToken(
+                self.consumed()
+                    .chars()
+                    .last()
+                    .expect("The consumed chars should not disappear"),
+            )),
+        }
     }
 
     fn expect_true(&mut self) -> Result<bool, ErrorKind> {
@@ -976,25 +956,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_parse_object() -> Result<(), Box<dyn std::error::Error>> {
-        let input = r#"
-        {
-          "key": "value",
-          "key2": "value"
-        }
-       "#;
-        let mut got = BTreeMap::from([("key", JsonValue::Null), ("key2", JsonValue::Null)]);
-        parse_object(input, &mut got)?;
-
-        let want = BTreeMap::from([
-            ("key", JsonValue::String(String::from("value"))),
-            ("key2", JsonValue::String(String::from("value"))),
-        ]);
-        assert_eq!(want, got);
-        Ok(())
-    }
-
     #[derive(PartialEq, Debug)]
     struct ParseValueTest {
         key: String,
@@ -1080,63 +1041,8 @@ mod tests {
         }
     }
 
-    impl FromJson for ParseValueTest {
-        fn fields(&self) -> Vec<&str> {
-            vec!["key", "key2"]
-        }
-
-        fn set(&mut self, key: &str, value: JsonValue) -> Result<(), ErrorKind> {
-            match key {
-                "key" => {
-                    self.key = JsonValue::try_into(value).map_err(|(want, got)| {
-                        ErrorKind::InvalidType {
-                            key: String::from(key),
-                            want,
-                            got,
-                        }
-                    })?
-                }
-                "key2" => {
-                    self.key2 = JsonValue::try_into(value).map_err(|(want, got)| {
-                        ErrorKind::InvalidType {
-                            key: String::from(key),
-                            want,
-                            got,
-                        }
-                    })?
-                }
-                _ => return Err(ErrorKind::Incomplete),
-            };
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn test_parse_any() -> Result<(), Box<dyn std::error::Error>> {
-        let input = r#"
-        {
-          "key": "value",
-          "key2": "value"
-        }
-       "#;
-        let mut got = ParseValueTest {
-            key: String::new(),
-            key2: String::new(),
-            nested: Default::default(),
-        };
-        parse_any(input, &mut got)?;
-
-        let want = ParseValueTest {
-            key: String::from("value"),
-            key2: String::from("value"),
-            nested: Default::default(),
-        };
-        assert_eq!(want, got);
-        Ok(())
-    }
-
     impl Parsable for Nested {
-        fn parse(&mut self, parser: &mut dyn PParser) -> Result<(), String> {
+        fn parse(&mut self, parser: &mut dyn Parser) -> Result<(), String> {
             while let Some(field_name) = parser.parse_string() {
                 match field_name.map_err(|err| err.to_string())?.as_str() {
                     "number" => {
@@ -1153,7 +1059,7 @@ mod tests {
         }
     }
     impl Parsable for ParseValueTest {
-        fn parse(&mut self, parser: &mut dyn PParser) -> Result<(), String> {
+        fn parse(&mut self, parser: &mut dyn Parser) -> Result<(), String> {
             while let Some(field_name) = parser.parse_string() {
                 match field_name.map_err(|err| err.to_string())?.as_str() {
                     "key" => {
@@ -1180,7 +1086,7 @@ mod tests {
     where
         T: Parsable + Default,
     {
-        fn parse(&mut self, parser: &mut dyn PParser) -> Result<(), String> {
+        fn parse(&mut self, parser: &mut dyn Parser) -> Result<(), String> {
             loop {
                 let mut base = T::default();
 
