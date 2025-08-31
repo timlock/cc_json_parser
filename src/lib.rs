@@ -152,8 +152,7 @@ enum Token {
     ArrayEnd,
     String,
     Number,
-    True,
-    False,
+    Bool,
     Null,
     Colon,
     Comma,
@@ -171,8 +170,7 @@ impl TryFrom<char> for Token {
             '\"' => Token::String,
             '-' => Token::Number,
             '0'..='9' => Token::Number,
-            't' => Token::True,
-            'f' => Token::False,
+            't'| 'f' => Token::Bool,
             'n' => Token::Null,
             ':' => Token::Colon,
             ',' => Token::Comma,
@@ -287,8 +285,7 @@ impl ObjectValidatorState {
                 | Token::ArrayBegin
                 | Token::String
                 | Token::Number
-                | Token::True
-                | Token::False
+                | Token::Bool
                 | Token::Null => Ok(ObjectValidatorState::Value),
                 _ => Err(ErrorKind::UnexpectedToken(' ')),
             },
@@ -345,8 +342,7 @@ impl ArrayValidatorState {
                 | Token::ArrayBegin
                 | Token::String
                 | Token::Number
-                | Token::True
-                | Token::False
+                | Token::Bool
                 | Token::Null => Ok(ArrayValidatorState::Value),
                 _ => Err(ErrorKind::UnexpectedToken(' ')),
             },
@@ -360,8 +356,7 @@ impl ArrayValidatorState {
                 | Token::ArrayBegin
                 | Token::String
                 | Token::Number
-                | Token::True
-                | Token::False
+                | Token::Bool
                 | Token::Null => Ok(ArrayValidatorState::Value),
                 _ => Err(ErrorKind::UnexpectedToken(' ')),
             },
@@ -411,8 +406,7 @@ impl<'a> IncrementalParser<'a> {
                 Token::ArrayBegin => Validator::Array(ArrayValidator::default()),
                 Token::String => return Some(self.inner.expect_string().map(JsonValue::from)),
                 Token::Number => return Some(self.inner.expect_number().map(JsonValue::from)),
-                Token::True => return Some(self.inner.expect_true().map(JsonValue::from)),
-                Token::False => return Some(self.inner.expect_false().map(JsonValue::from)),
+                Token::Bool => return Some(self.inner.expect_bool().map(JsonValue::from)),
                 Token::Null => return Some(self.inner.expect_null()),
                 _ => {
                     return Some(Err(ErrorKind::UnexpectedToken(
@@ -439,8 +433,7 @@ impl<'a> IncrementalParser<'a> {
                     .push(Validator::Array(ArrayValidator::default())),
                 Token::String => return Some(self.inner.expect_string().map(JsonValue::from)),
                 Token::Number => return Some(self.inner.expect_number().map(JsonValue::from)),
-                Token::True => return Some(self.inner.expect_true().map(JsonValue::from)),
-                Token::False => return Some(self.inner.expect_false().map(JsonValue::from)),
+                Token::Bool => return Some(self.inner.expect_bool().map(JsonValue::from)),
                 Token::Null => return Some(self.inner.expect_null()),
 
                 Token::ObjectEnd => {
@@ -474,8 +467,7 @@ impl<'a> IncrementalParser<'a> {
                         | Token::ArrayBegin
                         | Token::String
                         | Token::Number
-                        | Token::True
-                        | Token::False
+                        | Token::Bool
                         | Token::Null => return Ok(token),
                         Token::Colon | Token::Comma => {
                             // do nothing, we are only interested in values
@@ -493,8 +485,7 @@ impl<'a> IncrementalParser<'a> {
                         | Token::ArrayBegin
                         | Token::String
                         | Token::Number
-                        | Token::True
-                        | Token::False
+                        | Token::Bool
                         | Token::Null => return Ok(token),
                         Token::Comma => {
                             // do nothing, we are only interested in values
@@ -552,8 +543,7 @@ impl<'a> Parser<'a> {
             Token::ArrayBegin => self.expect_array().map(JsonValue::from),
             Token::String => self.expect_string().map(JsonValue::from),
             Token::Number => self.expect_number().map(JsonValue::from),
-            Token::True => self.expect_true().map(JsonValue::from),
-            Token::False => self.expect_false().map(JsonValue::from),
+            Token::Bool => self.expect_bool().map(JsonValue::from),
             Token::Null => self.expect_null(),
             _ => Err(ErrorKind::UnexpectedToken(
                 self.consumed().chars().last().unwrap(),
@@ -591,6 +581,14 @@ impl<'a> Parser<'a> {
 
     fn consumed(&self) -> &str {
         &self.content[..self.read]
+    }
+
+    fn expect_bool(&mut self) -> Result<bool, ErrorKind>{
+       match self.consumed().chars().last().expect("Should not to parse bool when no characters have been consumed"){
+           't' => self.expect_true(),
+           'f' => self.expect_false(),
+           _ => Err(ErrorKind::UnexpectedToken(self.consumed().chars().last().expect("The consumed chars should not disappear")))
+       }
     }
 
     fn expect_true(&mut self) -> Result<bool, ErrorKind> {
