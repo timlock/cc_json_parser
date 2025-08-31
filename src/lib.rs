@@ -212,41 +212,155 @@ pub fn parse_any(content: &str, want: &mut dyn FromJson) -> Result<(), Error> {
     Ok(())
 }
 
-pub fn parse_parsable<T>(src: &str, dst: &mut T) -> Result<(), &'static str>
+pub fn incremental_parse_parsable<T>(src: &str, dst: &mut T) -> Result<(), &'static str>
 where
     T: Parsable,
 {
-    let mut parser = StreamingParser::new(src);
+    let mut parser = IncrementalParser::new(src);
     dst.parse(&mut parser)
 }
 
-impl<'a> PParser for StreamingParser<'a> {
+impl<'a> PParser for IncrementalParser<'a> {
     fn parse_string(&mut self) -> Option<Result<String, &'static str>> {
-        todo!()
+        match self.next_value()? {
+            Ok(JsonValue::String(string)) => Some(Ok(string)),
+            Ok(other) => Some(Err("no string")),
+            Err(err) => Some(Err("error")),
+        }
     }
 
     fn parse_f64(&mut self) -> Option<Result<f64, &'static str>> {
-        todo!()
+        match self.next_value()? {
+            Ok(JsonValue::Number(number)) => Some(Ok(number)),
+            Ok(other) => Some(Err("no number")),
+            Err(err) => Some(Err("error")),
+        }
     }
 
     fn parse_bool(&mut self) -> Option<Result<bool, &'static str>> {
-        todo!()
+        match self.next_value()? {
+            Ok(JsonValue::Bool(bool)) => Some(Ok(bool)),
+            Ok(other) => Some(Err("no bool")),
+            Err(err) => Some(Err("error")),
+        }
+    }
+}
+
+enum ObjectValidator {
+    Begin,
+    Key,
+    Colon,
+    Value,
+    Comma,
+    End,
+}
+
+impl ObjectValidator {
+    fn apply(self, token: &Token) -> Result<ObjectValidator, ErrorKind> {
+        match self {
+            ObjectValidator::Begin => match token {
+                Token::ObjectEnd => Ok(ObjectValidator::End),
+                Token::String => Ok(ObjectValidator::Key),
+                _ => Err(ErrorKind::UnexpectedToken(' ')),
+            },
+            ObjectValidator::Key => match token {
+                Token::Colon => Ok(ObjectValidator::Colon),
+                _ => Err(ErrorKind::UnexpectedToken(' ')),
+            },
+            ObjectValidator::Colon => match token {
+                Token::ObjectBegin
+                | Token::ArrayBegin
+                | Token::String
+                | Token::Number
+                | Token::True
+                | Token::False
+                | Token::Null => Ok(ObjectValidator::Value),
+                _ => Err(ErrorKind::UnexpectedToken(' ')),
+            },
+            ObjectValidator::Value => match token {
+                Token::Comma => Ok(ObjectValidator::Comma),
+                Token::ObjectEnd => Ok(ObjectValidator::End),
+                _ => Err(ErrorKind::UnexpectedToken(' ')),
+            },
+            ObjectValidator::Comma => match token {
+                Token::String => Ok(ObjectValidator::Key),
+                _ => Err(ErrorKind::UnexpectedToken(' ')),
+            },
+            ObjectValidator::End => {
+                panic!("Object should not contain more tokens after the closing brace")
+            }
+        }
+    }
+}
+
+impl Default for ObjectValidator {
+    fn default() -> Self {
+        ObjectValidator::Begin
+    }
+}
+
+enum ArrayValidator {
+    Begin,
+    Value,
+    Comma,
+    End,
+}
+
+impl ArrayValidator {
+    fn apply(self, token: &Token) -> Result<ArrayValidator, ErrorKind> {
+        match self {
+            ArrayValidator::Begin => match token {
+                Token::ArrayEnd => Ok(ArrayValidator::End),
+                Token::ObjectBegin
+                | Token::ArrayBegin
+                | Token::String
+                | Token::Number
+                | Token::True
+                | Token::False
+                | Token::Null => Ok(ArrayValidator::Value),
+                _ => Err(ErrorKind::UnexpectedToken(' ')),
+            },
+            ArrayValidator::Value => match token {
+                Token::Comma => Ok(ArrayValidator::Comma),
+                Token::ArrayEnd => Ok(ArrayValidator::End),
+                _ => Err(ErrorKind::UnexpectedToken(' ')),
+            },
+            ArrayValidator::Comma => match token {
+                Token::ObjectBegin
+                | Token::ArrayBegin
+                | Token::String
+                | Token::Number
+                | Token::True
+                | Token::False
+                | Token::Null => Ok(ArrayValidator::Value),
+                _ => Err(ErrorKind::UnexpectedToken(' ')),
+            },
+            ArrayValidator::End => {
+                panic!("Object should not contain more tokens after the closing brace")
+            }
+        }
+    }
+}
+
+impl Default for ArrayValidator {
+    fn default() -> Self {
+        ArrayValidator::Begin
     }
 }
 
 enum ValueType {
-    Object,
-    Array,
+    Object(ObjectValidator),
+    Array(ArrayValidator),
 }
 
-pub struct StreamingParser<'a> {
+pub struct IncrementalParser<'a> {
     content: &'a str,
     read: usize,
     remaining: Vec<ValueType>,
     last_token: Option<Token>,
 }
 
-impl<'a> StreamingParser<'a> {
+impl<'a> IncrementalParser<'a> {
     pub fn new(content: &'a str) -> Self {
         Self {
             content,
@@ -267,8 +381,8 @@ impl<'a> StreamingParser<'a> {
             self.last_token = Some(next_token);
 
             let value_type = match next_token {
-                Token::ObjectBegin => ValueType::Object,
-                Token::ArrayBegin => ValueType::Array,
+                Token::ObjectBegin => ValueType::Object(ObjectValidator::Comma),
+                Token::ArrayBegin => ValueType::Array(ArrayValidator::Begin),
                 Token::String => return Some(self.expect_string().map(JsonValue::from)),
                 Token::Number => return Some(self.expect_number().map(JsonValue::from)),
                 Token::True => return Some(self.expect_true().map(JsonValue::from)),
@@ -284,36 +398,162 @@ impl<'a> StreamingParser<'a> {
             self.remaining.push(value_type);
         }
 
-        let current_type = self.remaining.last().unwrap();
+        loop {
+            let current_type = self.remaining.pop().unwrap();
 
-        match current_type {
-            ValueType::Object => {
-                match self.last_token.unwrap() {
-                    Token::ObjectBegin => {
-                        return match self.expect_string() {
-                            Ok(string) => {
-                                self.last_token = Some(Token::String);
-                                Some(Ok(JsonValue::from(string)))
-                            },
-                            Err(err) => Some(Err(err)),
-                        }
+
+
+            let result = match current_type {
+                ValueType::Object(validator) => {
+                    match validator.apply(&next_token) {
+                        Ok(state) => {}
+                        Err(err) => {}
                     }
-                    Token::ObjectEnd => {}
-                    Token::ArrayEnd => {}
-                    Token::String => {}
-                    Token::Number => {}
-                    Token::True => {}
-                    Token::False => {}
-                    Token::Null => {}
-                    Token::Colon => {}
-                    Token::Comma => {}
-                    _ =>
+                }
+                ValueType::Array(validator) => self.next_array_value()?,
+            };
+            match result {
+                Ok(token) => match token {
+                    Token::ObjectBegin => self.remaining.push(ValueType::Object),
+                    Token::ArrayBegin => self.remaining.push(ValueType::Object),
+                    Token::String => return Some(self.expect_string().map(JsonValue::from)),
+                    Token::Number => return Some(self.expect_number().map(JsonValue::from)),
+                    Token::True => return Some(self.expect_true().map(JsonValue::from)),
+                    Token::False => return Some(self.expect_false().map(JsonValue::from)),
+                    Token::Null => return Some(self.expect_null()),
+                    _ => panic!("next_object_value should not return {token:?}"),
+                },
+                Err(err) => return Some(Err(err)),
+            };
+        }
+        None
+    }
+
+    fn next_object_value(&mut self) -> Option<Result<Token, ErrorKind>> {
+        let next_token = match self
+            .next_token()
+            .expect("There should be more tokens available parsing is not complete")
+        {
+            Ok(token) => token,
+            Err(err) => return Some(Err(err)),
+        };
+    }
+    fn next_object_value(&mut self) -> Option<Result<Token, ErrorKind>> {
+        match self.last_token.unwrap() {
+            Token::ObjectBegin => {
+                let want = vec![Token::String, Token::ObjectEnd];
+                match self.expect_tokens(want) {
+                    Ok(Token::ObjectEnd) => None,
+                    Ok(_) => Some(Ok(Token::String)),
+                    Err(error_kind) => Some(Err(error_kind)),
                 }
             }
-            ValueType::Array => {}
+            Token::ArrayBegin => {
+                panic!(
+                    "Should not try to consume object fields after consuming an array begin token"
+                )
+            }
+            Token::String => {
+                let want = vec![Token::Comma, Token::ObjectEnd, Token::Colon];
+                match self.expect_tokens(want) {
+                    Ok(Token::ObjectEnd) => None,
+                    Ok(_) => match self.expect_token(Token::String) {
+                        Ok(()) => Some(Ok(Token::String)),
+                        Err(err) => Some(Err(err)),
+                    },
+                    Err(error_kind) => Some(Err(error_kind)),
+                }
+            }
+            Token::Number
+            | Token::True
+            | Token::False
+            | Token::Null
+            | Token::ArrayEnd
+            | Token::ObjectEnd => {
+                let want = vec![Token::Comma, Token::ObjectEnd];
+                match self.expect_tokens(want) {
+                    Ok(Token::ObjectEnd) => None,
+                    Ok(_) => match self.expect_token(Token::String) {
+                        Ok(()) => Some(Ok(Token::String)),
+                        Err(err) => Some(Err(err)),
+                    },
+                    Err(error_kind) => Some(Err(error_kind)),
+                }
+            }
+            Token::Colon => {
+                let want = vec![
+                    Token::ObjectBegin,
+                    Token::ArrayBegin,
+                    Token::String,
+                    Token::Number,
+                    Token::True,
+                    Token::False,
+                    Token::Null,
+                ];
+                match self.expect_tokens(want) {
+                    Ok(token) => Some(Ok(token)),
+                    Err(err) => Some(Err(err)),
+                }
+            }
+            Token::Comma => {
+                let want = vec![Token::String, Token::ObjectEnd];
+                match self.expect_tokens(want) {
+                    Ok(Token::ObjectEnd) => None,
+                    Ok(token) => Some(Ok(token)),
+                    Err(err) => Some(Err(err)),
+                }
+            }
         }
+    }
 
-        None
+    fn next_array_value(&mut self) -> Option<Result<Token, ErrorKind>> {
+        let value_tokens = vec![
+            Token::ObjectBegin,
+            Token::ArrayBegin,
+            Token::ArrayEnd,
+            Token::String,
+            Token::Number,
+            Token::True,
+            Token::False,
+            Token::Null,
+        ];
+        match self.last_token.unwrap() {
+            Token::ArrayBegin => match self.expect_tokens(value_tokens) {
+                Ok(Token::ArrayEnd) => None,
+                Ok(token) => Some(Ok(token)),
+                Err(error_kind) => Some(Err(error_kind)),
+            },
+            Token::ObjectBegin => {
+                panic!(
+                    "Should not try to consume array fields after consuming an object begin token"
+                )
+            }
+            Token::String
+            | Token::Number
+            | Token::True
+            | Token::False
+            | Token::Null
+            | Token::ArrayEnd
+            | Token::ObjectEnd => {
+                let want = vec![Token::Comma, Token::ArrayEnd];
+                match self.expect_tokens(want) {
+                    Ok(Token::ArrayEnd) => None,
+                    Ok(_) => match self.expect_tokens(value_tokens) {
+                        Ok(token) => Some(Ok(token)),
+                        Err(err) => Some(Err(err)),
+                    },
+                    Err(error_kind) => Some(Err(error_kind)),
+                }
+            }
+            Token::Colon => {
+                panic!("Should not try to consume array fields when last token was a colon")
+            }
+            Token::Comma => match self.expect_tokens(value_tokens) {
+                Ok(Token::ArrayEnd) => None,
+                Ok(token) => Some(Ok(token)),
+                Err(err) => Some(Err(err)),
+            },
+        }
     }
 
     fn expect_value(&mut self) -> Result<JsonValue, ErrorKind> {
@@ -361,6 +601,10 @@ impl<'a> StreamingParser<'a> {
 
     fn consumed(&self) -> &str {
         &self.content[..self.read]
+    }
+
+    fn last_consumed_char(&self) -> Option<char> {
+        self.consumed().chars().last()
     }
 
     fn expect_true(&mut self) -> Result<bool, ErrorKind> {
@@ -451,6 +695,7 @@ impl<'a> StreamingParser<'a> {
                 }
             };
             if !self.last_consumed_char_is_escaped() {
+                self.last_token = Some(Token::String);
                 let string = String::from(&self.content[begin..self.read - 1]);
                 return Ok(string);
             }
@@ -506,6 +751,20 @@ impl<'a> StreamingParser<'a> {
         }
     }
 
+    fn expect_tokens(&mut self, want: Vec<Token>) -> Result<Token, ErrorKind> {
+        match self.next_token() {
+            Some(Ok(token)) if want.contains(&token) => Ok(token),
+            Some(Ok(_)) => Err(ErrorKind::UnexpectedToken(
+                self.consumed()
+                    .chars()
+                    .last()
+                    .expect("there should be at least one consumed char after reading a token"),
+            )),
+            Some(Err(err)) => Err(err),
+            None => Err(ErrorKind::Incomplete),
+        }
+    }
+
     fn last_consumed_char_is_escaped(&self) -> bool {
         let mut is_escaped = false;
         let mut iter = self.consumed().chars().rev().skip(1);
@@ -514,6 +773,26 @@ impl<'a> StreamingParser<'a> {
         }
 
         is_escaped
+    }
+}
+
+pub fn parse_parsable<T>(src: &str, dst: &mut T) -> Result<(), &'static str>
+where
+    T: Parsable,
+{
+    let mut parser = Parser::new(src);
+    dst.parse(&mut parser)
+}
+
+impl<'a> PParser for Parser<'a> {
+    fn parse_string(&mut self) -> Option<Result<String, &'static str>> {}
+
+    fn parse_f64(&mut self) -> Option<Result<f64, &'static str>> {
+        todo!()
+    }
+
+    fn parse_bool(&mut self) -> Option<Result<bool, &'static str>> {
+        todo!()
     }
 }
 
@@ -1198,7 +1477,7 @@ mod tests {
             key2: String::new(),
             nested: Default::default(),
         };
-        parse_any(input, &mut got)?;
+        parse_parsable(input, &mut got)?;
 
         let want = ParseValueTest {
             key: String::from("value"),
