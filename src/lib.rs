@@ -1,60 +1,56 @@
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Display, Formatter};
+use std::iter::Peekable;
 use std::num::ParseFloatError;
-use std::str::CharIndices;
+use std::str::{CharIndices, FromStr, ParseBoolError};
+
+impl<'a> std::error::Error for Error<'a> {}
 
 #[derive(Debug, PartialEq)]
-pub struct Error {
-    pub error_kind: ErrorKind,
-    pub position: usize,
-}
-impl Display for Error {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} at position {}", self.error_kind, self.position)
-    }
-}
-
-impl std::error::Error for Error {}
-
-#[derive(Debug, PartialEq)]
-pub enum ErrorKind {
-    UnexpectedToken(char),
+pub enum Error<'a> {
+    UnexpectedToken(Token<'a>),
+    UnexpectedChar(char),
     Incomplete,
     ParseFloatError(ParseFloatError),
-    InvalidType {
-        key: String,
-        want: &'static str,
-        got: &'static str,
-    },
+    ParseBoolError(ParseBoolError),
     UnexpectedType(&'static str),
 }
 
-impl From<ParseFloatError> for ErrorKind {
+impl<'a> From<ParseFloatError> for Error<'a> {
     fn from(value: ParseFloatError) -> Self {
-        ErrorKind::ParseFloatError(value)
+        Error::ParseFloatError(value)
     }
 }
 
-impl Display for ErrorKind {
+impl<'a> From<ParseBoolError> for Error<'a> {
+    fn from(value: ParseBoolError) -> Self {
+        Error::ParseBoolError(value)
+    }
+}
+
+impl<'a> Display for Error<'a> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            ErrorKind::UnexpectedToken(token) => write!(f, "unexpected token {token}"),
-            ErrorKind::Incomplete => write!(f, "incomplete state"),
-            ErrorKind::ParseFloatError(err) => write!(f, "{}", err),
-            ErrorKind::InvalidType { key, want, got } => {
-                write!(f, "field '{}' is not of type {} but {}", key, want, got)
-            }
-            ErrorKind::UnexpectedType(want) => write!(f, "expected type {want}"),
+            Error::UnexpectedToken(token) => write!(
+                f,
+                "unexpected {:?} token {} at {}",
+                token.token_type, token.slice, token.start
+            ),
+            Error::UnexpectedChar(character) => write!(f, "unexpected character {character}"),
+            Error::Incomplete => write!(f, "incomplete state"),
+            Error::ParseFloatError(err) => write!(f, "{}", err),
+            Error::ParseBoolError(err) => write!(f, "{}", err),
+            Error::UnexpectedType(want) => write!(f, "expected type {want}"),
         }
     }
 }
 
 pub trait Parser {
-    fn parse_string(&mut self) -> Option<Result<String, ErrorKind>>;
-    fn parse_f64(&mut self) -> Option<Result<f64, ErrorKind>>;
+    fn parse_string(&mut self) -> Option<Result<String, Error>>;
+    fn parse_f64(&mut self) -> Option<Result<f64, Error>>;
 
-    fn parse_bool(&mut self) -> Option<Result<bool, ErrorKind>>;
+    fn parse_bool(&mut self) -> Option<Result<bool, Error>>;
 }
 
 pub trait Parsable {
@@ -141,39 +137,211 @@ impl From<bool> for JsonValue {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Token {
+pub struct Token<'a> {
+    token_type: TokenType,
+    start: usize,
+    len: usize,
+    char: char,
+    slice: &'a str,
+}
+impl<'a> Token<'a> {
+    pub fn parse_string(&self) -> &'a str {
+        if self.slice.is_empty() {
+            return "";
+        }
+        &self.slice[1..self.slice.len() - 1]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenType {
     ObjectBegin,
     ObjectEnd,
     ArrayBegin,
     ArrayEnd,
     String,
-    Number,
-    Bool,
-    Null,
+    Literal,
     Colon,
     Comma,
 }
 
-impl TryFrom<char> for Token {
-    type Error = ErrorKind;
+struct Lexer<'a> {
+    char_indices: Peekable<CharIndices<'a>>,
+    content: &'a str,
+}
 
-    fn try_from(value: char) -> Result<Self, Self::Error> {
-        let token = match value {
-            '{' => Token::ObjectBegin,
-            '}' => Token::ObjectEnd,
-            '[' => Token::ArrayBegin,
-            ']' => Token::ArrayEnd,
-            '\"' => Token::String,
-            '-' => Token::Number,
-            '0'..='9' => Token::Number,
-            't' | 'f' => Token::Bool,
-            'n' => Token::Null,
-            ':' => Token::Colon,
-            ',' => Token::Comma,
-            _ => return Err(ErrorKind::UnexpectedToken(value)),
+impl<'a> Lexer<'a> {
+    fn new(content: &'a str) -> Self {
+        Self {
+            char_indices: content.char_indices().peekable(),
+            content,
+        }
+    }
+
+    fn next_token(&mut self) -> Option<Result<Token<'a>, Error<'a>>> {
+        while let Some((index, character)) = self.char_indices.next() {
+            if character.is_whitespace() {
+                continue;
+            }
+
+            return Some(self.parse_token(index, character));
+        }
+        None
+    }
+
+    fn parse_token(&mut self, index: usize, character: char) -> Result<Token<'a>, Error<'a>> {
+        let token = match character {
+            ',' => {
+                let len = character.len_utf8();
+                Token {
+                    token_type: TokenType::Comma,
+                    start: index,
+                    len,
+                    char: character,
+                    slice: &self.content[index..index + len],
+                }
+            }
+            ':' => {
+                let len = character.len_utf8();
+                Token {
+                    token_type: TokenType::Colon,
+                    start: index,
+                    len,
+                    char: character,
+                    slice: &self.content[index..index + len],
+                }
+            }
+            '{' => {
+                let len = character.len_utf8();
+                Token {
+                    token_type: TokenType::ObjectBegin,
+                    start: index,
+                    len,
+                    char: character,
+                    slice: &self.content[index..index + len],
+                }
+            }
+            '}' => {
+                let len = character.len_utf8();
+                Token {
+                    token_type: TokenType::ObjectEnd,
+                    start: index,
+                    len,
+                    char: character,
+                    slice: &self.content[index..index + len],
+                }
+            }
+            '[' => {
+                let len = character.len_utf8();
+                Token {
+                    token_type: TokenType::ArrayBegin,
+                    start: index,
+                    len,
+                    char: character,
+                    slice: &self.content[index..index + len],
+                }
+            }
+
+            ']' => {
+                let len = character.len_utf8();
+                Token {
+                    token_type: TokenType::ArrayEnd,
+                    start: index,
+                    len,
+                    char: character,
+                    slice: &self.content[index..index + len],
+                }
+            }
+            '"' => match self.expect_string() {
+                Ok(end) => {
+                    let len = end + character.len_utf8() - index;
+                    Token {
+                        token_type: TokenType::String,
+                        start: index,
+                        len,
+                        char: character,
+                        slice: &self.content[index..index + len],
+                    }
+                }
+                Err(err) => return Err(err),
+            },
+            _ if character.is_alphanumeric()
+                || character == '+'
+                || character == '-'
+                || character == '.' =>
+            {
+                let len = self.expect_literal() + character.len_utf8();
+                Token {
+                    token_type: TokenType::Literal,
+                    start: index,
+                    len,
+                    char: character,
+                    slice: &self.content[index..index + len],
+                }
+            }
+
+            _ => return Err(Error::UnexpectedChar(character)),
         };
-
         Ok(token)
+    }
+
+    fn last_consumed_char_is_escaped(&mut self) -> bool {
+        let index = self
+            .char_indices
+            .peek()
+            .unwrap_or(&self.content.char_indices().last().expect(
+            "Should not check if character is escaped when the lexer works on zero length content",
+        )).0;
+        let iter = &mut self.content[..index].char_indices().rev().skip(1);
+
+        let mut is_escaped = false;
+        while let Some((_, '\\')) = iter.next() {
+            is_escaped = !is_escaped;
+        }
+
+        is_escaped
+    }
+
+    fn expect_string(&mut self) -> Result<usize, Error<'a>> {
+        loop {
+            let (index, char) = self.char_indices.next().ok_or(Error::Incomplete)?;
+            if char != '"' {
+                continue;
+            }
+            if !self.last_consumed_char_is_escaped() {
+                return Ok(index);
+            }
+        }
+    }
+
+    fn expect_literal(&mut self) -> usize {
+        let mut count = 0;
+        loop {
+            let (index, character) = match self.char_indices.peek() {
+                Some((index, character)) => (index, character),
+                None => break,
+            };
+
+            if character.is_alphanumeric()
+                || *character == '+'
+                || *character == '-'
+                || *character == '.'
+            {
+                count += 1;
+                self.char_indices.next();
+            } else {
+                break;
+            }
+        }
+        count
+    }
+}
+
+impl<'a> Iterator for Lexer<'a> {
+    type Item = Result<Token<'a>, Error<'a>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_token()
     }
 }
 
@@ -191,26 +359,26 @@ where
 }
 
 impl<'a> Parser for IncrementalParser<'a> {
-    fn parse_string(&mut self) -> Option<Result<String, ErrorKind>> {
+    fn parse_string(&mut self) -> Option<Result<String, Error>> {
         match self.next_value()? {
             Ok(JsonValue::String(string)) => Some(Ok(string)),
-            Ok(other) => Some(Err(ErrorKind::UnexpectedType("string"))),
+            Ok(other) => Some(Err(Error::UnexpectedType("string"))),
             Err(err) => Some(Err(err)),
         }
     }
 
-    fn parse_f64(&mut self) -> Option<Result<f64, ErrorKind>> {
+    fn parse_f64(&mut self) -> Option<Result<f64, Error>> {
         match self.next_value()? {
             Ok(JsonValue::Number(number)) => Some(Ok(number)),
-            Ok(other) => Some(Err(ErrorKind::UnexpectedType("number"))),
+            Ok(other) => Some(Err(Error::UnexpectedType("number"))),
             Err(err) => Some(Err(err)),
         }
     }
 
-    fn parse_bool(&mut self) -> Option<Result<bool, ErrorKind>> {
+    fn parse_bool(&mut self) -> Option<Result<bool, Error>> {
         match self.next_value()? {
             Ok(JsonValue::Bool(bool)) => Some(Ok(bool)),
-            Ok(other) => Some(Err(ErrorKind::UnexpectedType("bool"))),
+            Ok(other) => Some(Err(Error::UnexpectedType("bool"))),
             Err(err) => Some(Err(err)),
         }
     }
@@ -221,8 +389,8 @@ struct ObjectValidator {
     state: ObjectValidatorState,
 }
 
-impl ObjectValidator {
-    fn apply(&mut self, token: &Token) -> Result<(), ErrorKind> {
+impl<'a> ObjectValidator {
+    fn apply(&mut self, token: Token<'a>) -> Result<(), Error<'a>> {
         self.state = self.state.apply(token)?;
         Ok(())
     }
@@ -238,35 +406,33 @@ enum ObjectValidatorState {
     End,
 }
 
-impl ObjectValidatorState {
-    fn apply(self, token: &Token) -> Result<ObjectValidatorState, ErrorKind> {
+impl<'a> ObjectValidatorState {
+    fn apply(self, token: Token<'a>) -> Result<ObjectValidatorState, Error<'a>> {
         match self {
-            ObjectValidatorState::Begin => match token {
-                Token::ObjectEnd => Ok(ObjectValidatorState::End),
-                Token::String => Ok(ObjectValidatorState::Key),
-                _ => Err(ErrorKind::UnexpectedToken(' ')),
+            ObjectValidatorState::Begin => match token.token_type {
+                TokenType::ObjectEnd => Ok(ObjectValidatorState::End),
+                TokenType::String => Ok(ObjectValidatorState::Key),
+                _ => Err(Error::UnexpectedToken(token)),
             },
-            ObjectValidatorState::Key => match token {
-                Token::Colon => Ok(ObjectValidatorState::Colon),
-                _ => Err(ErrorKind::UnexpectedToken(' ')),
+            ObjectValidatorState::Key => match token.token_type {
+                TokenType::Colon => Ok(ObjectValidatorState::Colon),
+                _ => Err(Error::UnexpectedToken(token)),
             },
-            ObjectValidatorState::Colon => match token {
-                Token::ObjectBegin
-                | Token::ArrayBegin
-                | Token::String
-                | Token::Number
-                | Token::Bool
-                | Token::Null => Ok(ObjectValidatorState::Value),
-                _ => Err(ErrorKind::UnexpectedToken(' ')),
+            ObjectValidatorState::Colon => match token.token_type {
+                TokenType::ObjectBegin
+                | TokenType::ArrayBegin
+                | TokenType::String
+                | TokenType::Literal => Ok(ObjectValidatorState::Value),
+                _ => Err(Error::UnexpectedToken(token)),
             },
-            ObjectValidatorState::Value => match token {
-                Token::Comma => Ok(ObjectValidatorState::Comma),
-                Token::ObjectEnd => Ok(ObjectValidatorState::End),
-                _ => Err(ErrorKind::UnexpectedToken(' ')),
+            ObjectValidatorState::Value => match token.token_type {
+                TokenType::Comma => Ok(ObjectValidatorState::Comma),
+                TokenType::ObjectEnd => Ok(ObjectValidatorState::End),
+                _ => Err(Error::UnexpectedToken(token)),
             },
-            ObjectValidatorState::Comma => match token {
-                Token::String => Ok(ObjectValidatorState::Key),
-                _ => Err(ErrorKind::UnexpectedToken(' ')),
+            ObjectValidatorState::Comma => match token.token_type {
+                TokenType::String => Ok(ObjectValidatorState::Key),
+                _ => Err(Error::UnexpectedToken(token)),
             },
             ObjectValidatorState::End => {
                 panic!("Object should not contain more tokens after the closing brace")
@@ -288,8 +454,8 @@ struct ArrayValidator {
     state: ArrayValidatorState,
 }
 
-impl ArrayValidator {
-    fn apply(&mut self, token: &Token) -> Result<(), ErrorKind> {
+impl<'a> ArrayValidator {
+    fn apply(&mut self, token: Token<'a>) -> Result<(), Error<'a>> {
         self.state = self.state.apply(token)?;
         Ok(())
     }
@@ -303,32 +469,28 @@ enum ArrayValidatorState {
     End,
 }
 
-impl ArrayValidatorState {
-    fn apply(self, token: &Token) -> Result<ArrayValidatorState, ErrorKind> {
+impl<'a> ArrayValidatorState {
+    fn apply(self, token: Token<'a>) -> Result<ArrayValidatorState, Error<'a>> {
         match self {
-            ArrayValidatorState::Begin => match token {
-                Token::ArrayEnd => Ok(ArrayValidatorState::End),
-                Token::ObjectBegin
-                | Token::ArrayBegin
-                | Token::String
-                | Token::Number
-                | Token::Bool
-                | Token::Null => Ok(ArrayValidatorState::Value),
-                _ => Err(ErrorKind::UnexpectedToken(' ')),
+            ArrayValidatorState::Begin => match token.token_type {
+                TokenType::ArrayEnd => Ok(ArrayValidatorState::End),
+                TokenType::ObjectBegin
+                | TokenType::ArrayBegin
+                | TokenType::String
+                | TokenType::Literal => Ok(ArrayValidatorState::Value),
+                _ => Err(Error::UnexpectedToken(token)),
             },
-            ArrayValidatorState::Value => match token {
-                Token::Comma => Ok(ArrayValidatorState::Comma),
-                Token::ArrayEnd => Ok(ArrayValidatorState::End),
-                _ => Err(ErrorKind::UnexpectedToken(' ')),
+            ArrayValidatorState::Value => match token.token_type {
+                TokenType::Comma => Ok(ArrayValidatorState::Comma),
+                TokenType::ArrayEnd => Ok(ArrayValidatorState::End),
+                _ => Err(Error::UnexpectedToken(token)),
             },
-            ArrayValidatorState::Comma => match token {
-                Token::ObjectBegin
-                | Token::ArrayBegin
-                | Token::String
-                | Token::Number
-                | Token::Bool
-                | Token::Null => Ok(ArrayValidatorState::Value),
-                _ => Err(ErrorKind::UnexpectedToken(' ')),
+            ArrayValidatorState::Comma => match token.token_type {
+                TokenType::ObjectBegin
+                | TokenType::ArrayBegin
+                | TokenType::String
+                | TokenType::Literal => Ok(ArrayValidatorState::Value),
+                _ => Err(Error::UnexpectedToken(token)),
             },
             ArrayValidatorState::End => {
                 panic!("Object should not contain more tokens after the closing brace")
@@ -363,25 +525,21 @@ impl<'a> IncrementalParser<'a> {
         }
     }
 
-    fn next_value(&mut self) -> Option<Result<JsonValue, ErrorKind>> {
+    fn next_value(&mut self) -> Option<Result<JsonValue, Error<'a>>> {
         if self.validator_stack.is_empty() {
-            let next_token = self.inner.next_token()?;
+            let next_token = self.inner.lexer.next()?;
             let next_token = match next_token {
                 Ok(token) => token,
                 Err(err) => return Some(Err(err)),
             };
 
-            let validator = match next_token {
-                Token::ObjectBegin => Validator::Object(ObjectValidator::default()),
-                Token::ArrayBegin => Validator::Array(ArrayValidator::default()),
-                Token::String => return Some(self.inner.expect_string().map(JsonValue::from)),
-                Token::Number => return Some(self.inner.expect_number().map(JsonValue::from)),
-                Token::Bool => return Some(self.inner.expect_bool().map(JsonValue::from)),
-                Token::Null => return Some(self.inner.expect_null()),
+            let validator = match next_token.token_type {
+                TokenType::ObjectBegin => Validator::Object(ObjectValidator::default()),
+                TokenType::ArrayBegin => Validator::Array(ArrayValidator::default()),
+                TokenType::String => return Some(self.inner.expect_string().map(JsonValue::from)),
+                TokenType::Literal => return Some(self.inner.parse_literal(next_token)),
                 _ => {
-                    return Some(Err(ErrorKind::UnexpectedToken(
-                        self.inner.consumed().chars().last().unwrap(),
-                    )));
+                    return Some(Err(Error::UnexpectedToken(next_token)));
                 }
             };
 
@@ -394,23 +552,20 @@ impl<'a> IncrementalParser<'a> {
                 Err(err) => return Some(Err(err)),
             };
 
-            match token {
-                Token::ObjectBegin => self
+            match token.token_type {
+                TokenType::ObjectBegin => self
                     .validator_stack
                     .push(Validator::Object(ObjectValidator::default())),
-                Token::ArrayBegin => self
+                TokenType::ArrayBegin => self
                     .validator_stack
                     .push(Validator::Array(ArrayValidator::default())),
-                Token::String => return Some(self.inner.expect_string().map(JsonValue::from)),
-                Token::Number => return Some(self.inner.expect_number().map(JsonValue::from)),
-                Token::Bool => return Some(self.inner.expect_bool().map(JsonValue::from)),
-                Token::Null => return Some(self.inner.expect_null()),
-
-                Token::ObjectEnd => {
+                TokenType::String => return Some(self.inner.expect_string().map(JsonValue::from)),
+                TokenType::Literal => return Some(self.inner.parse_literal(token)),
+                TokenType::ObjectEnd => {
                     self.validator_stack.pop();
                     return None;
                 }
-                Token::ArrayEnd => {
+                TokenType::ArrayEnd => {
                     self.validator_stack.pop();
                     return None;
                 }
@@ -419,27 +574,22 @@ impl<'a> IncrementalParser<'a> {
         }
     }
 
-    fn next_container_value(&mut self) -> Result<Token, ErrorKind> {
+    fn next_container_value(&mut self) -> Result<Token<'a>, Error<'a>> {
         loop {
-            let token = self.inner.next_token().ok_or(ErrorKind::Incomplete)??;
+            let token = self.inner.lexer.next().ok_or(Error::Incomplete)??;
 
-            let validator = self
-                .validator_stack
-                .last_mut()
-                .ok_or(ErrorKind::Incomplete)?;
+            let validator = self.validator_stack.last_mut().ok_or(Error::Incomplete)?;
 
             match validator {
                 Validator::Object(validator_state) => {
-                    validator_state.apply(&token)?;
-                    match token {
-                        Token::ObjectBegin
-                        | Token::ObjectEnd
-                        | Token::ArrayBegin
-                        | Token::String
-                        | Token::Number
-                        | Token::Bool
-                        | Token::Null => return Ok(token),
-                        Token::Colon | Token::Comma => {
+                    validator_state.apply(token)?;
+                    match token.token_type {
+                        TokenType::ObjectBegin
+                        | TokenType::ObjectEnd
+                        | TokenType::ArrayBegin
+                        | TokenType::String
+                        | TokenType::Literal => return Ok(token),
+                        TokenType::Colon | TokenType::Comma => {
                             // do nothing, we are only interested in values
                         }
                         _ => panic!(
@@ -448,16 +598,14 @@ impl<'a> IncrementalParser<'a> {
                     }
                 }
                 Validator::Array(validator_state) => {
-                    validator_state.apply(&token)?;
-                    match token {
-                        Token::ObjectBegin
-                        | Token::ArrayEnd
-                        | Token::ArrayBegin
-                        | Token::String
-                        | Token::Number
-                        | Token::Bool
-                        | Token::Null => return Ok(token),
-                        Token::Comma => {
+                    validator_state.apply(token)?;
+                    match token.token_type {
+                        TokenType::ObjectBegin
+                        | TokenType::ArrayEnd
+                        | TokenType::ArrayBegin
+                        | TokenType::String
+                        | TokenType::Literal => return Ok(token),
+                        TokenType::Comma => {
                             // do nothing, we are only interested in values
                         }
                         _ => panic!(
@@ -471,32 +619,28 @@ impl<'a> IncrementalParser<'a> {
 }
 
 pub struct JSONParser<'a> {
+    lexer: Peekable<Lexer<'a>>,
     content: &'a str,
-    read: usize,
 }
 
 impl<'a> JSONParser<'a> {
     pub fn new(content: &str) -> JSONParser {
-        JSONParser { content, read: 0 }
+        JSONParser {
+            lexer: Lexer::new(content).peekable(),
+            content,
+        }
     }
 
-    pub fn next(&mut self) -> Result<JsonValue, Error> {
-        self.expect_value().map_err(|error_kind| Error {
-            error_kind,
-            position: self.read,
-        })
+    pub fn next(&mut self) -> Result<JsonValue, Error<'a>> {
+        self.expect_value()
     }
 
-    pub fn parse_object(&mut self, want: &mut BTreeMap<String, JsonValue>) -> Result<(), Error> {
-        self.expect_token(Token::ObjectBegin)
-            .map_err(|error_kind| Error {
-                error_kind,
-                position: self.read,
-            })?;
-        let mut got = self.expect_object().map_err(|error_kind| Error {
-            error_kind,
-            position: self.read,
-        })?;
+    pub fn parse_object(
+        &mut self,
+        want: &mut BTreeMap<String, JsonValue>,
+    ) -> Result<(), Error<'a>> {
+        self.expect_token(TokenType::ObjectBegin)?;
+        let mut got = self.expect_object()?;
 
         for (key, value) in want.iter_mut() {
             if let Some(got_value) = got.remove(key) {
@@ -507,124 +651,70 @@ impl<'a> JSONParser<'a> {
         Ok(())
     }
 
-    fn expect_value(&mut self) -> Result<JsonValue, ErrorKind> {
-        match self.next_token().ok_or(ErrorKind::Incomplete)?? {
-            Token::ObjectBegin => self.expect_object().map(JsonValue::from),
-            Token::ArrayBegin => self.expect_array().map(JsonValue::from),
-            Token::String => self.expect_string().map(JsonValue::from),
-            Token::Number => self.expect_number().map(JsonValue::from),
-            Token::Bool => self.expect_bool().map(JsonValue::from),
-            Token::Null => self.expect_null(),
-            _ => Err(ErrorKind::UnexpectedToken(
-                self.consumed().chars().last().unwrap(),
-            )),
-        }
-    }
-
-    fn next_token(&mut self) -> Option<Result<Token, ErrorKind>> {
-        for (index, character) in self.remaining().char_indices() {
-            if character.is_whitespace() {
-                continue;
+    fn expect_value(&mut self) -> Result<JsonValue, Error<'a>> {
+        let token = self.lexer.next().ok_or(Error::Incomplete)??;
+        match token.token_type {
+            TokenType::ObjectBegin => self.expect_object().map(JsonValue::from),
+            TokenType::ArrayBegin => self.expect_array().map(JsonValue::from),
+            TokenType::String => {
+                let string = String::from(token.parse_string());
+                Ok(JsonValue::String(string))
             }
-
-            self.read += index + character.len_utf8();
-
-            return Some(Token::try_from(character));
+            TokenType::Literal => self.parse_literal(token),
+            _ => Err(Error::UnexpectedToken(token)),
         }
-        None
     }
 
-    fn peek_next_token(&self) -> Option<Result<Token, ErrorKind>> {
-        for character in self.remaining().chars() {
-            if character.is_whitespace() {
-                continue;
+    fn parse_literal(&self, token: Token<'a>) -> Result<JsonValue, Error<'a>> {
+        match token.char {
+            '-' | '0'..='9' => {
+                let number = token.slice.parse()?;
+                Ok(JsonValue::Number(number))
             }
-
-            return Some(Token::try_from(character));
-        }
-        None
-    }
-
-    fn remaining(&self) -> &str {
-        &self.content[self.read..]
-    }
-
-    fn consumed(&self) -> &str {
-        &self.content[..self.read]
-    }
-
-    fn expect_bool(&mut self) -> Result<bool, ErrorKind> {
-        match self
-            .consumed()
-            .chars()
-            .last()
-            .expect("Should not to parse bool when no characters have been consumed")
-        {
-            't' => self.expect_true(),
-            'f' => self.expect_false(),
-            _ => Err(ErrorKind::UnexpectedToken(
-                self.consumed()
-                    .chars()
-                    .last()
-                    .expect("The consumed chars should not disappear"),
-            )),
+            't' | 'f' => {
+                let boolean = bool::from_str(token.slice)?;
+                Ok(JsonValue::Bool(boolean))
+            }
+            'n' => match token.slice.to_lowercase().as_str() {
+                "null" => Ok(JsonValue::Null),
+                _ => Err(Error::UnexpectedToken(token)),
+            },
+            _ => Err(Error::UnexpectedToken(token)),
         }
     }
 
-    fn expect_true(&mut self) -> Result<bool, ErrorKind> {
-        self.expect_char('r')?;
-        self.expect_char('u')?;
-        self.expect_char('e')?;
-        Ok(true)
-    }
-
-    fn expect_false(&mut self) -> Result<bool, ErrorKind> {
-        self.expect_char('a')?;
-        self.expect_char('l')?;
-        self.expect_char('s')?;
-        self.expect_char('e')?;
-        Ok(false)
-    }
-
-    fn expect_null(&mut self) -> Result<JsonValue, ErrorKind> {
-        self.expect_char('u')?;
-        self.expect_char('l')?;
-        self.expect_char('l')?;
-        Ok(JsonValue::Null)
-    }
-
-    fn expect_object(&mut self) -> Result<BTreeMap<String, JsonValue>, ErrorKind> {
+    fn expect_object(&mut self) -> Result<BTreeMap<String, JsonValue>, Error<'a>> {
         let mut object = BTreeMap::new();
 
-        if let Some(Ok(Token::ObjectEnd)) = self.peek_next_token() {
-            self.expect_token(Token::ObjectEnd)?;
+        if self.next_token_is(TokenType::ObjectEnd) {
+            self.expect_token(TokenType::ObjectEnd)?;
             return Ok(object);
         }
 
         loop {
-            self.expect_token(Token::String)?;
-            let key = self.expect_string()?;
+            let token = self.expect_token(TokenType::String)?;
+            let key = String::from(token.parse_string());
 
-            self.expect_token(Token::Colon)?;
+            self.expect_token(TokenType::Colon)?;
             let value = self.expect_value()?;
             object.insert(key, value);
 
-            if Token::Comma != self.peek_next_token().ok_or(ErrorKind::Incomplete)?? {
+            if !self.next_token_is(TokenType::Comma) {
                 break;
             }
-            self.expect_token(Token::Comma)?;
+            self.expect_token(TokenType::Comma)?;
         }
 
-        self.expect_token(Token::ObjectEnd)?;
+        self.expect_token(TokenType::ObjectEnd)?;
 
         Ok(object)
     }
 
-    fn expect_array(&mut self) -> Result<Vec<JsonValue>, ErrorKind> {
+    fn expect_array(&mut self) -> Result<Vec<JsonValue>, Error<'a>> {
         let mut array = Vec::new();
 
-        if let Some(Ok(Token::ArrayEnd)) = self.peek_next_token() {
-            self.expect_token(Token::ArrayEnd)?;
+        if self.next_token_is(TokenType::ArrayEnd) {
+            self.expect_token(TokenType::ArrayEnd)?;
             return Ok(array);
         }
 
@@ -632,96 +722,43 @@ impl<'a> JSONParser<'a> {
             let item = self.expect_value()?;
             array.push(item);
 
-            if Token::Comma != self.peek_next_token().ok_or(ErrorKind::Incomplete)?? {
+            if !self.next_token_is(TokenType::Comma) {
                 break;
             }
-            self.expect_token(Token::Comma)?;
+            self.expect_token(TokenType::Comma)?;
         }
 
-        self.expect_token(Token::ArrayEnd)?;
+        self.expect_token(TokenType::ArrayEnd)?;
 
         Ok(array)
     }
 
-    fn expect_string(&mut self) -> Result<String, ErrorKind> {
-        let begin = self.read;
-        loop {
-            let candidate = self
-                .remaining()
-                .char_indices()
-                .find(|(i, c)| return *c == '"');
-
-            match candidate {
-                Some((pos, character)) => self.read += pos + character.len_utf8(),
-                None => {
-                    self.read = self.content.len();
-                    return Err(ErrorKind::Incomplete);
-                }
-            };
-            if !self.last_consumed_char_is_escaped() {
-                let string = String::from(&self.content[begin..self.read - 1]);
-                return Ok(string);
-            }
-        }
-    }
-
-    fn expect_number(&mut self) -> Result<f64, ErrorKind> {
-        let begin = self.read - 1;
-
-        let mut iter = self.remaining().chars();
-        let mut read = 0;
-
-        while let Some(character) = iter.next() {
-            if character.is_ascii_digit()
-                || character == '+'
-                || character == '-'
-                || character == '.'
-                || character == 'e'
-                || character == 'E'
-            {
-                read += character.len_utf8();
-            } else {
-                break;
-            }
-        }
-        self.read += read;
-        let number = String::from(&self.consumed()[begin..]);
-
-        Ok(number.parse()?)
-    }
-
-    fn expect_char(&mut self, want: char) -> Result<(), ErrorKind> {
-        let (result, read) = match self.remaining().char_indices().next() {
-            Some((i, c)) if c == want => (Ok(()), i + c.len_utf8()),
-            Some((i, c)) => (Err(ErrorKind::UnexpectedToken(c)), i + c.len_utf8()),
-            None => (Err(ErrorKind::Incomplete), 0),
+    fn expect_string(&mut self) -> Result<String, Error<'a>> {
+        let token = self.lexer.next().ok_or(Error::Incomplete)??;
+        match token.token_type {
+            TokenType::String => {}
+            _ => return Err(Error::UnexpectedToken(token)),
         };
-        self.read += read;
-        result
+
+        Ok(String::from(
+            &self.content[token.start..(token.start + token.len)],
+        ))
     }
 
-    fn expect_token(&mut self, want: Token) -> Result<(), ErrorKind> {
-        match self.next_token() {
-            Some(Ok(token)) if token == want => Ok(()),
-            Some(Ok(_)) => Err(ErrorKind::UnexpectedToken(
-                self.consumed()
-                    .chars()
-                    .last()
-                    .expect("there should be at least one consumed char after reading a token"),
-            )),
+    fn expect_token(&mut self, want: TokenType) -> Result<Token<'a>, Error<'a>> {
+        match self.lexer.next() {
+            Some(Ok(token)) if token.token_type == want => Ok(token),
+            Some(Ok(token)) => Err(Error::UnexpectedToken(token)),
             Some(Err(err)) => Err(err),
-            None => Err(ErrorKind::Incomplete),
+            None => Err(Error::Incomplete),
         }
     }
 
-    fn last_consumed_char_is_escaped(&self) -> bool {
-        let mut is_escaped = false;
-        let mut iter = self.consumed().chars().rev().skip(1);
-        while let Some('\\') = iter.next() {
-            is_escaped = !is_escaped;
+    fn next_token_is(&mut self, want: TokenType) -> bool {
+        match self.lexer.peek() {
+            Some(Ok(token)) if token.token_type == want => true,
+            _ => false,
         }
-
-        is_escaped
     }
 }
 
