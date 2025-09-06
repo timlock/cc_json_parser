@@ -2,7 +2,6 @@ use crate::lexer::{Lexer, Token, TokenType};
 use crate::{Error, JsonValue};
 use std::any::Any;
 use std::collections::BTreeMap;
-use std::fmt::{Debug, Display};
 use std::iter::Peekable;
 use std::str::FromStr;
 
@@ -32,7 +31,6 @@ pub trait Unmarshal: Any {
         value: &dyn Unmarshal,
     ) -> Result<(), UnmarshalError>;
 }
-
 
 pub fn parse(content: &str) -> Result<JsonValue, Error> {
     let mut parser = JSONParser::new(content);
@@ -248,7 +246,9 @@ impl<'a> IncrementalParser<'a> {
                 TokenType::ArrayBegin => self
                     .validator_stack
                     .push(Validator::Array(ArrayValidator::default())),
-                TokenType::String => return Some(Ok(JsonValue::from(String::from(token.parse_string())))),
+                TokenType::String => {
+                    return Some(Ok(JsonValue::from(String::from(token.parse_string()))));
+                }
                 TokenType::Literal => return Some(self.inner.parse_literal(token)),
                 TokenType::ObjectEnd => {
                     self.validator_stack.pop();
@@ -304,6 +304,53 @@ impl<'a> IncrementalParser<'a> {
                 }
             }
         }
+    }
+}
+
+pub trait Parsable2 {
+    fn parse<P>(&mut self, parser: &mut P) -> Result<(), P::Err>
+    where
+        P: Parser2;
+}
+
+pub trait Parser2 {
+    type Err;
+
+    fn parse_string(&mut self) -> Option<Result<String, Self::Err>>;
+    fn parse_number(&mut self) -> Option<Result<f64, Self::Err>>;
+    fn parse_bool(&mut self) -> Option<Result<bool, Self::Err>>;
+
+    fn parse_map(&mut self) -> Option<Result<(), Self::Err>>;
+    fn parse_list(&mut self) -> Option<Result<(), Self::Err>>;
+
+    fn skip(&mut self) -> Option<Result<(), Self::Err>>;
+}
+
+impl<'a> Parser2 for IncrementalParser<'a> {
+    type Err = Error<'a>;
+
+    fn parse_string(&mut self) -> Option<Result<String, Self::Err>> {
+        todo!()
+    }
+
+    fn parse_number(&mut self) -> Option<Result<f64, Self::Err>> {
+        todo!()
+    }
+
+    fn parse_bool(&mut self) -> Option<Result<bool, Self::Err>> {
+        todo!()
+    }
+
+    fn parse_map(&mut self) -> Option<Result<(), Self::Err>> {
+
+    }
+
+    fn parse_list(&mut self) -> Option<Result<(), Self::Err>> {
+        todo!()
+    }
+
+    fn skip(&mut self) -> Option<Result<(), Self::Err>> {
+        todo!()
     }
 }
 
@@ -375,8 +422,7 @@ impl<'a> JSONParser<'a> {
     fn expect_object(&mut self) -> Result<BTreeMap<String, JsonValue>, Error<'a>> {
         let mut object = BTreeMap::new();
 
-        if self.next_token_is(TokenType::ObjectEnd) {
-            self.expect_token(TokenType::ObjectEnd)?;
+        if self.try_token(TokenType::ObjectEnd).is_some() {
             return Ok(object);
         }
 
@@ -388,10 +434,10 @@ impl<'a> JSONParser<'a> {
             let value = self.expect_value()?;
             object.insert(key, value);
 
-            if !self.next_token_is(TokenType::Comma) {
-                break;
+
+            if self.try_token(TokenType::Comma).is_none() {
+                break
             }
-            self.expect_token(TokenType::Comma)?;
         }
 
         self.expect_token(TokenType::ObjectEnd)?;
@@ -402,8 +448,7 @@ impl<'a> JSONParser<'a> {
     fn expect_array(&mut self) -> Result<Vec<JsonValue>, Error<'a>> {
         let mut array = Vec::new();
 
-        if self.next_token_is(TokenType::ArrayEnd) {
-            self.expect_token(TokenType::ArrayEnd)?;
+        if self.try_token(TokenType::ArrayEnd).is_some() {
             return Ok(array);
         }
 
@@ -411,10 +456,9 @@ impl<'a> JSONParser<'a> {
             let item = self.expect_value()?;
             array.push(item);
 
-            if !self.next_token_is(TokenType::Comma) {
-                break;
+            if self.try_token(TokenType::Comma).is_none() {
+                break
             }
-            self.expect_token(TokenType::Comma)?;
         }
 
         self.expect_token(TokenType::ArrayEnd)?;
@@ -436,6 +480,13 @@ impl<'a> JSONParser<'a> {
             Some(Ok(token)) => Err(Error::UnexpectedToken(token)),
             Some(Err(err)) => Err(err),
             None => Err(Error::Incomplete),
+        }
+    }
+
+    fn try_token(&mut self, want: TokenType) -> Option<Result<Token<'a>, Error<'a>>>{
+        match self.lexer.peek() {
+            Some(Ok(token)) if token.token_type == want => Some(self.expect_token(want)),
+            _ => None,
         }
     }
 
